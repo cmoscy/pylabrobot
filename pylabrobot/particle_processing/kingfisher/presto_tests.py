@@ -9,7 +9,6 @@ Tests BDZ builder output structure and high-level step methods (mix, dry, etc.).
 import asyncio
 import gzip
 import binascii
-import warnings
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,8 +22,9 @@ from .bdz_builder import (
   build_release_beads_bdz,
 )
 from .presto_connection import _find_complete_message
-from .presto_backend import _cmd_xml, KingFisherPrestoBackend
+from .presto_backend import _cmd_xml, KingFisherPrestoBackend, TurntableLocation
 from .presto import KingFisherPresto
+from .presto_connection import PrestoConnectionError
 
 
 class TestFindCompleteMessage:
@@ -166,6 +166,120 @@ class TestCmdXml:
   def test_list_protocols(self):
     out = _cmd_xml("ListProtocols")
     assert out == '<Cmd name="ListProtocols"/>\n'
+
+  def test_rotate(self):
+    out = _cmd_xml("Rotate", nest="1", position="2")
+    assert 'name="Rotate"' in out
+    assert 'nest="1"' in out
+    assert 'position="2"' in out
+
+  def test_rotate_processing_maps_to_spec_position_1(self):
+    """rotate(position=1, location='processing') -> nest=1, position=1."""
+    out = _cmd_xml("Rotate", nest="1", position="1")
+    assert 'nest="1"' in out
+    assert 'position="1"' in out
+
+  def test_rotate_loading_maps_to_spec_position_2(self):
+    """rotate(position=1, location='loading') -> nest=1, position=2."""
+    out = _cmd_xml("Rotate", nest="1", position="2")
+    assert 'nest="1"' in out
+    assert 'position="2"' in out
+
+
+class TestTurntableState:
+  """Turntable state: unknown after init/setup; updated on Ready; not updated on Error."""
+
+  def test_get_turntable_state_after_init_returns_none_for_both(self):
+    backend = KingFisherPrestoBackend()
+    assert backend.get_turntable_state() == {1: None, 2: None}
+
+  def test_get_turntable_state_after_setup_returns_none_for_both(self):
+    backend = KingFisherPrestoBackend()
+    with patch.object(backend._conn, "setup", new_callable=AsyncMock), patch.object(
+      backend._conn, "send_command", new_callable=AsyncMock
+    ) as mock_send:
+      mock_send.return_value = ET.fromstring(
+        '<Res name="Connect" ok="true"><Instrument>KF</Instrument><Version>1</Version><Serial>123</Serial></Res>'
+      )
+      asyncio.run(backend.setup())
+    assert backend.get_turntable_state() == {1: None, 2: None}
+
+  def test_rotate_position_1_location_loading_sends_nest_1_position_2(self):
+    backend = KingFisherPrestoBackend()
+    evt_ready = ET.fromstring('<Evt name="Ready"/>')
+    with patch.object(backend._conn, "send_command", new_callable=AsyncMock) as mock_send, patch.object(
+      backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_ready]
+    ):
+      asyncio.run(backend.rotate(position=1, location="loading"))
+    call_args = mock_send.call_args[0][0]
+    assert "nest=\"1\"" in call_args
+    assert "position=\"2\"" in call_args
+    assert backend.get_turntable_state() == {1: "loading", 2: "processing"}
+
+  def test_rotate_position_1_location_processing_sends_nest_1_position_1(self):
+    backend = KingFisherPrestoBackend()
+    evt_ready = ET.fromstring('<Evt name="Ready"/>')
+    with patch.object(backend._conn, "send_command", new_callable=AsyncMock), patch.object(
+      backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_ready]
+    ):
+      asyncio.run(backend.rotate(position=1, location="processing"))
+    assert backend.get_turntable_state() == {1: "processing", 2: "loading"}
+
+  def test_rotate_on_error_does_not_update_state_and_raises(self):
+    backend = KingFisherPrestoBackend()
+    evt_error = ET.fromstring('<Evt name="Error"><Error code="5">Turntable position error.</Error></Evt>')
+    with patch.object(backend._conn, "send_command", new_callable=AsyncMock), patch.object(
+      backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_error]
+    ), patch.object(backend, "error_acknowledge", new_callable=AsyncMock) as mock_ack:
+      with pytest.raises(PrestoConnectionError) as exc_info:
+        asyncio.run(backend.rotate(position=1, location="loading"))
+    assert backend.get_turntable_state() == {1: None, 2: None}
+    mock_ack.assert_called_once()
+    assert "Turntable position error" in str(exc_info.value) or "5" in str(exc_info.value)
+
+  def test_stop_clears_turntable_state(self):
+    backend = KingFisherPrestoBackend()
+    backend._position_at_processing = 1
+    with patch.object(backend._conn, "send_command", new_callable=AsyncMock), patch.object(
+      backend._conn, "stop", new_callable=AsyncMock
+    ):
+      asyncio.run(backend.stop())
+    assert backend.get_turntable_state() == {1: None, 2: None}
+
+  def test_load_plate_when_unknown_raises_value_error(self):
+    backend = KingFisherPrestoBackend()
+    assert backend._position_at_processing is None
+    with pytest.raises(ValueError, match="Turntable state unknown"):
+      asyncio.run(backend.load_plate())
+
+  def test_load_plate_when_known_calls_rotate_position_at_loading_to_processing(self):
+    backend = KingFisherPrestoBackend()
+    backend._position_at_processing = 1  # position 1 at processing, so position 2 at loading
+    evt_ready = ET.fromstring('<Evt name="Ready"/>')
+    with patch.object(backend._conn, "send_command", new_callable=AsyncMock) as mock_send, patch.object(
+      backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_ready]
+    ):
+      asyncio.run(backend.load_plate())
+    # load_plate() should rotate position 2 to processing (nest=2, position=1)
+    call_args = mock_send.call_args[0][0]
+    assert "nest=\"2\"" in call_args
+    assert "position=\"1\"" in call_args
+    assert backend.get_turntable_state() == {1: "loading", 2: "processing"}
+
+  def test_setup_initialize_turntable_true_calls_rotate_1_processing(self):
+    backend = KingFisherPrestoBackend()
+    evt_ready = ET.fromstring('<Evt name="Ready"/>')
+    connect_res = ET.fromstring(
+      '<Res name="Connect" ok="true"><Instrument>KF</Instrument><Version>1</Version><Serial>123</Serial></Res>'
+    )
+    rotate_res = ET.fromstring('<Res name="Rotate" ok="true"/>')
+    with patch.object(backend._conn, "setup", new_callable=AsyncMock), patch.object(
+      backend._conn, "send_command", new_callable=AsyncMock
+    ) as mock_send, patch.object(backend._conn, "get_event", new_callable=AsyncMock, return_value=evt_ready):
+      mock_send.side_effect = [connect_res, rotate_res]
+      asyncio.run(backend.setup(initialize_turntable=True))
+    assert backend._position_at_processing == 1
+    assert backend.get_turntable_state() == {1: "processing", 2: "loading"}
 
 
 class TestPrestoBackendGetProtocolTimeLeft:
@@ -397,7 +511,7 @@ class TestBdzBuilder:
     props, exported = _decompress_bdz_blocks(bdz)
     assert b"<Dry " in exported
     assert b"Plate1" in exported
-    assert b"PT5M" in exported or b"Duration" in exported.decode("utf-8")
+    assert b"PT5M" in exported or b"Duration" in exported
 
   def test_build_collect_beads_bdz_structure(self):
     bdz = build_collect_beads_bdz("plr_CollectBeads", 3, 30.0, plate_name="P1")
@@ -479,3 +593,41 @@ class TestPrestoHighLevelApi:
     asyncio.run(presto.collect_beads(count=3, collect_time_sec=30.0, wait_until_ready=False))
     assert mock_backend.upload_protocol.call_args[0][0] == "plr_CollectBeads"
     mock_backend.start_protocol.assert_called_once_with("plr_CollectBeads", tip=None, step=None)
+
+  def test_rotate_delegates_to_backend_with_position_and_location(self):
+    mock_backend = MagicMock()
+    mock_backend.rotate = AsyncMock(return_value=None)
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    asyncio.run(presto.rotate(position=1, location=TurntableLocation.LOADING))
+    mock_backend.rotate.assert_called_once_with(position=1, location=TurntableLocation.LOADING)
+
+  def test_get_turntable_state_delegates_to_backend(self):
+    mock_backend = MagicMock()
+    mock_backend.get_turntable_state.return_value = {1: "processing", 2: "loading"}
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    # get_turntable_state is async (due to @need_setup_finished decorator)
+    result = asyncio.run(presto.get_turntable_state())
+    assert result == {1: "processing", 2: "loading"}
+    mock_backend.get_turntable_state.assert_called_once()
+
+  def test_load_plate_delegates_to_backend(self):
+    mock_backend = MagicMock()
+    mock_backend.load_plate = AsyncMock(return_value=None)
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    asyncio.run(presto.load_plate())
+    mock_backend.load_plate.assert_called_once()
+
+  def test_load_plate_when_backend_raises_value_error_propagates(self):
+    mock_backend = MagicMock()
+    mock_backend.load_plate = AsyncMock(side_effect=ValueError("Turntable state unknown; call rotate() first to establish state."))
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    with pytest.raises(ValueError, match="Turntable state unknown"):
+      asyncio.run(presto.load_plate())

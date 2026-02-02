@@ -11,11 +11,11 @@ import base64
 import binascii
 import logging
 import xml.etree.ElementTree as ET
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from pylabrobot.machines.backend import MachineBackend
 
-from .error_codes import get_error_code_description
+from .error_codes import format_error_message, get_error_code_description
 from .presto_connection import (
   KINGFISHER_PID,
   KINGFISHER_VID,
@@ -38,6 +38,21 @@ def _cmd_xml(name: str, **attrs: Optional[str]) -> str:
 
 def _text(el: Optional[ET.Element]) -> Optional[str]:
   return el.text.strip() if el is not None and el.text else None
+
+
+class TurntableLocation:
+  """Location of a turntable position: processing (under the magnetic head) or loading (load/unload station)."""
+
+  PROCESSING = "processing"
+  LOADING = "loading"
+
+
+def _normalize_location(location: Union[str, TurntableLocation]) -> str:
+  """Return 'processing' or 'loading'. Accept TurntableLocation constants or string."""
+  s = str(location).strip().lower()
+  if s in ("processing", "loading"):
+    return s
+  raise ValueError(f"location must be 'processing' or 'loading', got {location!r}")
 
 
 class KingFisherPrestoBackend(MachineBackend):
@@ -67,10 +82,17 @@ class KingFisherPrestoBackend(MachineBackend):
     self._instrument: Optional[str] = None
     self._version: Optional[str] = None
     self._serial: Optional[str] = None
+    self._position_at_processing: Optional[int] = None
 
-  async def setup(self) -> None:
-    """Open HID, send Connect, parse instrument/version/serial, start read loop."""
+  async def setup(self, initialize_turntable: bool = False) -> None:
+    """Open HID, send Connect, parse instrument/version/serial, start read loop.
+
+    Turntable state is reset to unknown on every setup (covers reconnect/power cycle).
+    When initialize_turntable is True, after Connect the backend rotates to power-on state
+    (position 1 at processing, position 2 at loading) so positions are known; the table may move.
+    """
     await self._conn.setup()
+    self._position_at_processing = None
     res = await self._conn.send_command(_cmd_xml("Connect"))
     self._instrument = _text(res.find("Instrument"))
     self._version = _text(res.find("Version"))
@@ -81,6 +103,8 @@ class KingFisherPrestoBackend(MachineBackend):
       self._version,
       self._serial,
     )
+    if initialize_turntable:
+      await self.rotate(position=1, location=TurntableLocation.PROCESSING)
 
   async def stop(self) -> None:
     """Send Disconnect (instrument may not reply), stop read loop, close HID."""
@@ -92,6 +116,7 @@ class KingFisherPrestoBackend(MachineBackend):
     self._instrument = None
     self._version = None
     self._serial = None
+    self._position_at_processing = None
 
   async def connect(self, set_time: Optional[str] = None) -> None:
     """Send Connect command (e.g. to set time). Connection is already established by setup(). setTime: YYYY-MM-DD hh:mm:ss."""
@@ -209,6 +234,90 @@ class KingFisherPrestoBackend(MachineBackend):
   async def stop_protocol(self) -> None:
     """Stop ongoing protocol/step execution."""
     await self._conn.send_command(_cmd_xml("Stop"))
+
+  async def rotate(
+    self,
+    position: int = 1,
+    location: Union[str, TurntableLocation] = TurntableLocation.LOADING,
+  ) -> None:
+    """Rotate the turntable so the given position (1 or 2) is at the given location.
+
+    The turntable has two positions (slots) 1 and 2. Each can be at location \"processing\"
+    (under the magnetic head) or \"loading\" (the load/unload station). This command moves
+    one position to the requested location. State is inferred from Ready; on Error state
+    is not updated and PrestoConnectionError is raised.
+    """
+    if position not in (1, 2):
+      raise ValueError("position must be 1 or 2")
+    normalized_location = _normalize_location(location)
+    spec_position = 1 if normalized_location == "processing" else 2
+    await self._conn.send_command(
+      _cmd_xml("Rotate", nest=str(position), position=str(spec_position))
+    )
+    while True:
+      evt = await self._conn.get_event()
+      name = evt.get("name")
+      if name == "Ready":
+        self._position_at_processing = (
+          position if normalized_location == "processing" else (3 - position)
+        )
+        return
+      if name == "Error":
+        await self.error_acknowledge()
+        err_el = evt.find("Error")
+        code = int(err_el.get("code", 0)) if err_el is not None and err_el.get("code") else None
+        instrument_text = _text(err_el) if err_el is not None else None
+        msg = format_error_message(code, instrument_text, kind="error")
+        raise PrestoConnectionError(msg, code=code, res_name=name)
+      # Ignore other events (e.g. StepStarted, Temperature)
+
+  def get_turntable_state(self) -> Dict[int, Optional[str]]:
+    """Return current location of each position: {1: 'processing'|'loading'|None, 2: ...}.
+
+    State is inferred only from rotate() commands that completed with Ready; unknown after
+    setup/stop until the first successful rotate (or setup(initialize_turntable=True)).
+    """
+    if self._position_at_processing is None:
+      return {1: None, 2: None}
+    return {
+      1: "processing" if self._position_at_processing == 1 else "loading",
+      2: "processing" if self._position_at_processing == 2 else "loading",
+    }
+
+  async def load_plate(self) -> None:
+    """Rotate so whatever is at the loading position moves to the processing position.
+
+    Requires known turntable state (call rotate() first or setup(initialize_turntable=True)).
+    Raises ValueError if state is unknown.
+    """
+    if self._position_at_processing is None:
+      raise ValueError("Turntable state unknown; call rotate() first to establish state.")
+    position_at_loading = 3 - self._position_at_processing
+    await self.rotate(position=position_at_loading, location=TurntableLocation.PROCESSING)
+
+  async def pick_up_tips(self) -> None:
+    """Run a single PickUpTips step (build .bdz, upload, start, wait for Ready).
+
+    Not yet implemented: requires reverse-engineering the PickUpTips step XML from a
+    real .bdz or spec and adding build_pick_up_tips_bdz() to bdz_builder.py. Until then,
+    use start_protocol(protocol, tip=..., step=...) with a protocol that has a tip pickup step.
+    """
+    raise NotImplementedError(
+      "pick_up_tips() not yet implemented; need PickUpTips step XML and build_pick_up_tips_bdz() in bdz_builder. "
+      "Use start_protocol(protocol, tip=..., step=...) with a protocol that has a tip pickup step."
+    )
+
+  async def drop_tips(self) -> None:
+    """Run a single DropTips step (build .bdz, upload, start, wait for Ready).
+
+    Not yet implemented: requires reverse-engineering the DropTips step XML from a
+    real .bdz or spec and adding build_drop_tips_bdz() to bdz_builder.py. Until then,
+    use start_protocol(protocol, tip=..., step=...) with a protocol that has a drop-tips step.
+    """
+    raise NotImplementedError(
+      "drop_tips() not yet implemented; need DropTips step XML and build_drop_tips_bdz() in bdz_builder. "
+      "Use start_protocol(protocol, tip=..., step=...) with a protocol that has a drop-tips step."
+    )
 
   @property
   def instrument(self) -> Optional[str]:

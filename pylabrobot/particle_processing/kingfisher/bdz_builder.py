@@ -3,12 +3,15 @@
 Used by the liquid-handler-like API (mix, dry, collect_beads, release_beads, pause).
 Only supported speed names are exposed; unsupported speeds raise ValueError.
 See BDZ_FORMAT.md for layout and step parameters.
+
+TODO: Add PickUpTips and DropTips step builders when the step XML is known (from spec or
+reverse-engineering a real .bdz). Then add build_pick_up_tips_bdz() and build_drop_tips_bdz();
+frontend pick_up_tips() and drop_tips() will use the same pattern as mix/dry (upload slot, start, wait).
 """
 
 import gzip
 import struct
 import uuid
-from typing import Optional
 
 # Protocol slot names for dynamic step-wise execution (overwrite by default).
 STEP_SLOTS = {

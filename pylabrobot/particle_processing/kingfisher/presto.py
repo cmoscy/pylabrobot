@@ -8,7 +8,7 @@ Liquid-handler-like API: mix(), dry(), collect_beads(), release_beads(), pause()
 
 import warnings
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pylabrobot.machines.machine import Machine, need_setup_finished
 
@@ -20,7 +20,7 @@ from .bdz_builder import (
   build_pause_bdz,
   build_release_beads_bdz,
 )
-from .presto_backend import KingFisherPrestoBackend
+from .presto_backend import KingFisherPrestoBackend, TurntableLocation
 
 
 class KingFisherPresto(Machine):
@@ -35,9 +35,13 @@ class KingFisherPresto(Machine):
     self.backend: KingFisherPrestoBackend = backend
     self._last_run_state: Optional[Dict[str, Any]] = None
 
-  async def setup(self, **backend_kwargs) -> None:
-    """Connect (backend.setup), then check run state; warn if instrument is not Idle (Busy or In error)."""
-    await super().setup(**backend_kwargs)
+  async def setup(self, *, initialize_turntable: bool = False, **backend_kwargs) -> None:
+    """Connect (backend.setup), then check run state; warn if instrument is not Idle (Busy or In error).
+
+    When initialize_turntable is True, the backend rotates to power-on state on connect so
+    turntable positions are known; the table may move. Passed to backend.setup().
+    """
+    await super().setup(initialize_turntable=initialize_turntable, **backend_kwargs)
     state = await self.get_run_state()
     if state.get("status") != "Idle":
       msg = state.get("message", "")
@@ -274,6 +278,57 @@ class KingFisherPresto(Machine):
     await self.start_protocol(slot)
     if wait_until_ready:
       await self._run_until_ready()
+
+  @need_setup_finished
+  async def rotate(
+    self,
+    position: int = 1,
+    location: Union[str, TurntableLocation] = TurntableLocation.LOADING,
+  ) -> None:
+    """Rotate the turntable so the given position (1 or 2) is at the given location.
+
+    The turntable has two positions (slots) 1 and 2. Each can be at \"processing\" (under the
+    magnetic head) or \"loading\" (the load/unload station). The backend waits for Ready/Error.
+    For explicit state use get_turntable_state(); for bringing the plate at loading to
+    processing use load_plate().
+    """
+    await self.backend.rotate(position=position, location=location)
+
+  @need_setup_finished
+  async def get_turntable_state(self) -> Dict[int, Optional[str]]:
+    """Return current location of each position: {1: 'processing'|'loading'|None, 2: ...}.
+
+    State is inferred only from rotate() commands that completed with Ready; unknown after
+    setup/stop until the first successful rotate (or setup(initialize_turntable=True)).
+    """
+    return self.backend.get_turntable_state()
+
+  @need_setup_finished
+  async def load_plate(self) -> None:
+    """Rotate the table so whatever is at the loading position moves to the processing position.
+
+    Requires known turntable state; call rotate() first or setup(initialize_turntable=True)
+    if state is unknown. For explicit control use rotate() and get_turntable_state().
+    """
+    await self.backend.load_plate()
+
+  @need_setup_finished
+  async def pick_up_tips(self) -> None:
+    """Run a single PickUpTips step (build .bdz, upload, start, wait for Ready).
+
+    Not yet implemented; requires PickUpTips step XML and build_pick_up_tips_bdz() in bdz_builder.
+    Until then use start_protocol(protocol, tip=..., step=...) with a protocol that has a tip pickup step.
+    """
+    await self.backend.pick_up_tips()
+
+  @need_setup_finished
+  async def drop_tips(self) -> None:
+    """Run a single DropTips step (build .bdz, upload, start, wait for Ready).
+
+    Not yet implemented; requires DropTips step XML and build_drop_tips_bdz() in bdz_builder.
+    Until then use start_protocol(protocol, tip=..., step=...) with a protocol that has a drop-tips step.
+    """
+    await self.backend.drop_tips()
 
   @property
   def instrument(self) -> Optional[str]:

@@ -108,7 +108,15 @@ class PrestoConnection:
     self._stopping = False
 
   async def setup(self) -> None:
-    """Open HID and start the background read loop."""
+    """Open HID and start the background read loop.
+
+    Idempotent: if already set up (read loop running), returns immediately so callers
+    can re-run setup to refresh instrument state (e.g. send Connect again) without
+    re-opening the device (which would raise HIDException).
+    """
+    if self._read_task is not None and not self._read_task.done():
+      logger.debug("KingFisher Presto connection: already set up, skipping open.")
+      return
     await self._hid.setup()
     self._stopping = False
     self._read_task = asyncio.create_task(self._read_loop())
