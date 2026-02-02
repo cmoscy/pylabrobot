@@ -11,7 +11,7 @@ import base64
 import binascii
 import logging
 import xml.etree.ElementTree as ET
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pylabrobot.machines.backend import MachineBackend
 
@@ -128,6 +128,17 @@ class KingFisherPrestoBackend(MachineBackend):
       "error_text": error_text,
       "error_code_description": error_code_description,
     }
+
+  async def get_protocol_time_left(self, protocol: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """Get time left of protocol or single-step execution. Returns time_left and time_to_pause (XML Duration).
+    For single-step execution the spec omits TimeToPause; time_to_pause will be None."""
+    cmd = _cmd_xml("GetProtocolTimeLeft", protocol=protocol)
+    res = await self._conn.send_command(cmd, raise_on_error=False)
+    time_left_el = res.find("TimeLeft")
+    time_to_pause_el = res.find("TimeToPause")
+    time_left = time_left_el.get("value") if time_left_el is not None else None
+    time_to_pause = time_to_pause_el.get("value") if time_to_pause_el is not None else None
+    return {"time_left": time_left, "time_to_pause": time_to_pause}
 
   async def list_protocols(self) -> Tuple[List[str], int]:
     """List protocols in instrument memory. Returns (protocol_names, memory_used_percent)."""
