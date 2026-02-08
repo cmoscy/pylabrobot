@@ -3,11 +3,12 @@
 Tests _find_complete_message (XML message boundaries, nested Res/Evt) and
 XML command building (_cmd_xml) per the KingFisher Presto Interface Specification.
 Also tests protocol CRC-32 formula used for UploadProtocol (BDZ_FORMAT.md).
-Tests BDZ builder output structure and high-level step methods (mix, dry, etc.).
+Tests BDZ builder output structure and run_protocol (protocol-based run).
 """
 
 import asyncio
 import binascii
+from pathlib import Path
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +20,16 @@ from .bdz_builder import (
   build_mix_bdz,
   build_pause_bdz,
   build_release_beads_bdz,
+  read_bdz,
+)
+from .kingfisher_protocol import (
+  KingFisherProtocol,
+  Plate,
+  PlateType,
+  Tip,
+  TipPosition,
+  Image,
+  parse_bdz_to_protocol,
 )
 from .presto_connection import _find_complete_message
 from .presto_backend import _cmd_xml, KingFisherPrestoBackend, TurntableLocation
@@ -314,7 +325,7 @@ class TestPrestoBackendGetProtocolTimeLeft:
 
 
 class TestPrestoReconnectContinue:
-  """Frontend: get_protocol_time_left, get_run_state, setup warning, continue_run, run_until_ready (no stop)."""
+  """Frontend: get_protocol_time_left, get_run_state, setup warning, next_event (no run_until_ready/continue_run)."""
 
   def test_get_protocol_time_left_delegates_to_backend(self):
     mock_backend = MagicMock()
@@ -358,7 +369,7 @@ class TestPrestoReconnectContinue:
     with patch("pylabrobot.particle_processing.kingfisher.presto.warnings.warn") as mock_warn:
       result = asyncio.run(presto.get_run_state())
     assert result["status"] == "Busy"
-    assert "continue_run" in result["message"]
+    assert "existing run" in result["message"] and ("next_event" in result["message"] or "stop_protocol" in result["message"])
     assert result["time_left"] == "PT2M42S"
     mock_warn.assert_not_called()
 
@@ -378,7 +389,7 @@ class TestPrestoReconnectContinue:
         asyncio.run(presto.setup())
     mock_warn.assert_not_called()
 
-  def test_setup_when_busy_warns_with_continue_run_and_time_left(self):
+  def test_setup_when_busy_warns_with_next_event_and_time_left(self):
     mock_backend = MagicMock()
     mock_backend.setup = AsyncMock()
     mock_backend._setup_finished = True
@@ -386,7 +397,7 @@ class TestPrestoReconnectContinue:
     with patch.object(presto, "get_run_state", new_callable=AsyncMock) as mock_gr:
       mock_gr.return_value = {
         "status": "Busy",
-        "message": "Protocol in progress. Call continue_run() to attach to the event stream. Time left: PT2M42S.",
+        "message": "Protocol in progress (existing run). Attach to continue with next_event(), or stop_protocol() or abort() to stop. Time left: PT2M42S.",
         "time_left": "PT2M42S",
         "time_to_pause": None,
       }
@@ -394,22 +405,22 @@ class TestPrestoReconnectContinue:
         asyncio.run(presto.setup())
     mock_warn.assert_called_once()
     call_args = mock_warn.call_args[0]
-    assert "continue_run" in call_args[0]
+    assert "existing protocol" in call_args[0] or "attach" in call_args[0]
     assert "PT2M42S" in call_args[0]
 
-  async def _consume_run_until_ready(self, presto):
+  async def _drain_next_event_loop(self, presto, *, attach: bool = False):
+    """Loop next_event() until Ready/Aborted/Error; return list of (name, evt, ack)."""
     items = []
-    async for name, evt, ack in presto.run_until_ready():
+    while True:
+      name, evt, ack = await presto.next_event(attach=attach)
       items.append((name, evt, ack))
+      if name in ("Ready", "Aborted", "Error"):
+        break
+      attach = False
     return items
 
-  async def _consume_continue_run(self, presto):
-    items = []
-    async for name, evt, ack in presto.continue_run():
-      items.append((name, evt, ack))
-    return items
-
-  def test_continue_run_when_idle_yields_ready_once(self):
+  def test_next_event_attach_when_idle_drain_returns_ready_once(self):
+    """Draining with next_event(attach=True) when Idle returns [(Ready, None, None)] without reading queue."""
     mock_backend = MagicMock()
     mock_backend.get_status = AsyncMock(
       return_value={"ok": True, "status": "Idle", "error_code": None, "error_text": None, "error_code_description": None}
@@ -417,41 +428,68 @@ class TestPrestoReconnectContinue:
     mock_backend._setup_finished = True
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
-    items = asyncio.run(self._consume_continue_run(presto))
+    items = asyncio.run(self._drain_next_event_loop(presto, attach=True))
     assert items == [("Ready", None, None)]
 
-  def test_continue_run_when_busy_no_stop_protocol(self):
+  def test_next_event_attach_when_busy_no_stop_protocol(self):
+    """Draining with next_event(attach=True) when Busy consumes events until Ready; does not call stop_protocol."""
     mock_backend = MagicMock()
     mock_backend.get_status = AsyncMock(
       return_value={"ok": True, "status": "Busy", "error_code": None, "error_text": None, "error_code_description": None}
     )
     evt_ready = ET.fromstring('<Evt name="Ready"/>')
-    async def event_gen():
-      yield evt_ready
-    mock_backend.events = lambda: event_gen()
+    mock_backend.get_event = AsyncMock(side_effect=[evt_ready])
     mock_backend._setup_finished = True
     mock_backend.stop_protocol = AsyncMock()
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
-    items = asyncio.run(self._consume_continue_run(presto))
+    items = asyncio.run(self._drain_next_event_loop(presto, attach=True))
     assert len(items) == 1
     assert items[0][0] == "Ready"
     mock_backend.stop_protocol.assert_not_called()
 
-  def test_run_until_ready_does_not_call_stop_protocol(self):
+  def test_next_event_loop_does_not_call_stop_protocol(self):
+    """Draining with next_event() until Ready does not call stop_protocol."""
     mock_backend = MagicMock()
     evt_ready = ET.fromstring('<Evt name="Ready"/>')
-    async def event_gen():
-      yield evt_ready
-    mock_backend.events = lambda: event_gen()
+    mock_backend.get_event = AsyncMock(side_effect=[evt_ready])
     mock_backend._setup_finished = True
     mock_backend.stop_protocol = AsyncMock()
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
-    items = asyncio.run(self._consume_run_until_ready(presto))
+    items = asyncio.run(self._drain_next_event_loop(presto))
     assert len(items) == 1
     assert items[0][0] == "Ready"
     mock_backend.stop_protocol.assert_not_called()
+
+  def test_next_event_returns_one_event(self):
+    """next_event() returns one (name, evt, ack) from the event queue."""
+    mock_backend = MagicMock()
+    evt_load = ET.fromstring('<Evt name="LoadPlate" plate="Plate1"/>')
+    mock_backend.get_event = AsyncMock(side_effect=[evt_load])
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    name, evt, ack = asyncio.run(presto.next_event())
+    assert name == "LoadPlate"
+    assert evt is evt_load
+    assert ack is not None and callable(ack)
+
+  def test_next_event_attach_when_idle_returns_ready_without_reading_queue(self):
+    """next_event(attach=True) when status is Idle returns (Ready, None, None) without reading queue."""
+    mock_backend = MagicMock()
+    mock_backend.get_status = AsyncMock(
+      return_value={"ok": True, "status": "Idle", "error_code": None, "error_text": None, "error_code_description": None}
+    )
+    mock_backend.get_event = AsyncMock()
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    name, evt, ack = asyncio.run(presto.next_event(attach=True))
+    assert name == "Ready"
+    assert evt is None
+    assert ack is None
+    mock_backend.get_event.assert_not_called()
 
 
 class TestProtocolCrc32:
@@ -545,46 +583,145 @@ class TestBdzBuilder:
     assert b1 == b2
 
 
-class TestPrestoHighLevelApi:
-  """High-level step methods (mix, dry, etc.) call builder, upload, start with correct slot."""
+class TestKingFisherProtocol:
+  """KingFisher protocol representation: build protocol, to_bdz, roundtrip from example BDZ."""
 
-  def test_mix_upload_and_start_with_plr_mix_when_wait_until_ready_false(self):
+  def test_build_protocol_like_96_well_to_bdz(self):
+    """Build a protocol with one tip, 7 steps, 4 plates; to_bdz produces valid structure."""
+    p = KingFisherProtocol(name="test96")
+    tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+    dwp = Plate.create("96 DWP", PlateType.DWP_96)
+    wp1 = Plate.create("96WP", PlateType.WP_96)
+    wp2 = Plate.create("96 WP", PlateType.WP_96)
+    p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p.add_plate(dwp)
+    p.add_plate(wp1)
+    p.add_plate(wp2)
+    p.add_collect_beads("CollectBeads1", "96 DWP", 3, 5.0)
+    p.add_release_beads("ReleaseBeads1", "96 DWP", 5.0, "Fast")
+    p.add_mix(
+      "Mix1", "96 DWP",
+      image=Image.Heating, loop_count=3,
+      heating_temperature=37, heating_preheat=True,
+      collect_beads_time_sec=3.0,
+    )
+    p.add_dry("Dry1", 300.0, TipPosition.AboveSurface)
+    p.add_pause("Pause1", "")
+    p.add_mix(
+      "Mix2", None,
+      precollect_enabled=True, loop_count=1,
+      pause_tip_position=TipPosition.EdgeInLiquid,
+      heating_temperature=32, heating_preheat=True,
+      postmix_enabled=True, postmix_duration_sec=3.0,
+      collect_beads_time_sec=5.0,
+    )
+    p.add_release_beads("ReleaseBeads2", "96 WP", 5.0, "Fast")
+    bdz = p.to_bdz()
+    assert bdz[:4] == bytes.fromhex("b6751cf2")
+    _, _, _, exported = read_bdz(bdz)
+    assert b"<ExportedData" in exported
+    assert b"<Tip " in exported
+    assert b"CollectBeads1" in exported
+    assert b"ReleaseBeads1" in exported
+    assert b"Mix1" in exported
+    assert b"Dry1" in exported
+    assert b"Pause1" in exported
+    assert b"Mix2" in exported
+    assert b"ReleaseBeads2" in exported
+    assert len(p.plates) == 4
+    assert len(p.tips) == 1
+    assert len(p.tips[0].steps) == 7
+
+  def test_roundtrip_96_well_bdz(self):
+    """Parse 96-well example BDZ -> protocol -> to_bdz; re-parse and assert structure matches."""
+    bdz_path = Path(__file__).resolve().parent / "presto_docs" / "260202_test-protocol-96.bdz"
+    if not bdz_path.exists():
+      pytest.skip("96-well example BDZ not found")
+    bdz = bdz_path.read_bytes()
+    p = parse_bdz_to_protocol(bdz)
+    assert p.name == "260202_test-protocol-96"
+    assert len(p.plates) == 4
+    assert len(p.tips) == 1
+    assert len(p.tips[0].steps) == 7
+    out_bdz = p.to_bdz()
+    assert len(out_bdz) > 0
+    p2 = parse_bdz_to_protocol(out_bdz)
+    assert p2.name == p.name
+    assert len(p2.plates) == len(p.plates)
+    assert len(p2.tips) == len(p.tips)
+    assert len(p2.tips[0].steps) == len(p.tips[0].steps)
+    plate_names = {pl.name for pl in p.plates}
+    assert plate_names == {pl.name for pl in p2.plates}
+    step_names = [s.name for s in p.tips[0].steps]
+    assert step_names == [s.name for s in p2.tips[0].steps]
+
+
+class TestPrestoHighLevelApi:
+  """run_protocol uploads and starts with correct args; delegation to backend."""
+
+  def _minimal_protocol(self) -> KingFisherProtocol:
+    """One tip, one Mix step (for run_protocol tests)."""
+    p = KingFisherProtocol(name="TestRun")
+    tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+    p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p.add_plate(Plate.create("96 DWP", PlateType.DWP_96))
+    p.add_mix("Mix1", "96 DWP", image=Image.Heating, loop_count=3)
+    return p
+
+  def test_run_protocol_upload_and_start_with_protocol_name(self):
     mock_backend = MagicMock()
     mock_backend.upload_protocol = AsyncMock(return_value=None)
     mock_backend.start_protocol = AsyncMock(return_value=None)
     mock_backend._setup_finished = True
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
-    asyncio.run(presto.mix("Wash1", 30.0, speed="Fast", wait_until_ready=False))
+    protocol = self._minimal_protocol()
+    asyncio.run(presto.run_protocol(protocol))
     mock_backend.upload_protocol.assert_called_once()
     call_args = mock_backend.upload_protocol.call_args
-    assert call_args[0][0] == "plr_Mix"
-    assert isinstance(call_args[0][1], bytes)
-    assert call_args[0][1][:4] == bytes.fromhex("b6751cf2")
-    mock_backend.start_protocol.assert_called_once_with("plr_Mix", tip=None, step=None)
+    assert call_args[0][0] == protocol.name
+    assert call_args[0][1] == protocol.to_bdz()
+    mock_backend.start_protocol.assert_called_once_with(protocol.name, tip=None, step=None)
 
-  def test_dry_upload_and_start_with_plr_dry(self):
+  def test_run_protocol_with_step_name_defaults_tip_for_single_tip(self):
     mock_backend = MagicMock()
     mock_backend.upload_protocol = AsyncMock(return_value=None)
     mock_backend.start_protocol = AsyncMock(return_value=None)
     mock_backend._setup_finished = True
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
-    asyncio.run(presto.dry(60.0, plate="Plate1", wait_until_ready=False))
-    mock_backend.upload_protocol.assert_called_once()
-    assert mock_backend.upload_protocol.call_args[0][0] == "plr_Dry"
-    mock_backend.start_protocol.assert_called_once_with("plr_Dry", tip=None, step=None)
+    protocol = self._minimal_protocol()
+    asyncio.run(presto.run_protocol(protocol, step_name="Mix1"))
+    mock_backend.start_protocol.assert_called_once_with(
+      protocol.name, tip=protocol.tips[0].name, step="Mix1"
+    )
 
-  def test_collect_beads_upload_and_start_with_plr_collect_beads(self):
+  def test_run_protocol_then_next_event_loop_drains_events(self):
+    """Canonical flow: run_protocol() then loop next_event() until Ready; events are received."""
     mock_backend = MagicMock()
     mock_backend.upload_protocol = AsyncMock(return_value=None)
     mock_backend.start_protocol = AsyncMock(return_value=None)
     mock_backend._setup_finished = True
+    evt_ready = ET.fromstring('<Evt name="Ready"/>')
+    mock_backend.get_event = AsyncMock(side_effect=[evt_ready])
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
-    asyncio.run(presto.collect_beads(count=3, collect_time_sec=30.0, wait_until_ready=False))
-    assert mock_backend.upload_protocol.call_args[0][0] == "plr_CollectBeads"
-    mock_backend.start_protocol.assert_called_once_with("plr_CollectBeads", tip=None, step=None)
+    protocol = self._minimal_protocol()
+
+    async def run_then_drain():
+      await presto.run_protocol(protocol)
+      items = []
+      while True:
+        name, evt, ack = await presto.next_event()
+        items.append((name, evt, ack))
+        if name in ("Ready", "Aborted", "Error"):
+          break
+      return items
+
+    items = asyncio.run(run_then_drain())
+    assert len(items) == 1
+    assert items[0][0] == "Ready"
+    assert items[0][2] is None  # Ready has no ack callback
 
   def test_rotate_delegates_to_backend_with_position_and_location(self):
     mock_backend = MagicMock()

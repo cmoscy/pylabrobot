@@ -2,24 +2,20 @@
 
 Same lifecycle as other machines (setup(), stop(), async with).
 Exposes start_protocol(), get_status(), acknowledge(), error_acknowledge(),
-and async for evt in backend.events() for event-based orchestration.
-Liquid-handler-like API: mix(), dry(), collect_beads(), release_beads(), pause().
+next_event() for the next (name, evt, ack), and events() for a raw event stream.
+Main way to run: build or load a KingFisherProtocol and call run_protocol(protocol)
+to upload and start; then drive the run by calling next_event() in a loop. Handle each
+event (LoadPlate, RemovePlate, ChangePlate, Pause, etc.), do your work (robot, user),
+then await ack() when required. Stop when name is Ready, Aborted, or Error.
 """
 
 import warnings
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pylabrobot.machines.machine import Machine, need_setup_finished
 
-from .bdz_builder import (
-  STEP_SLOTS,
-  build_collect_beads_bdz,
-  build_dry_bdz,
-  build_mix_bdz,
-  build_pause_bdz,
-  build_release_beads_bdz,
-)
+from .kingfisher_protocol import KingFisherProtocol
 from .presto_backend import KingFisherPrestoBackend, TurntableLocation
 
 
@@ -27,7 +23,7 @@ class KingFisherPresto(Machine):
   """High-level KingFisher Presto magnetic particle processor.
 
   Wraps KingFisherPrestoBackend; same API pattern as Thermocycler/Machine.
-  Use async for evt in self.backend.events() to react to LoadPlate, RemovePlate, etc.
+  Use next_event() for (name, evt, ack) or events() for a raw event stream.
   """
 
   def __init__(self, backend: KingFisherPrestoBackend):
@@ -46,7 +42,7 @@ class KingFisherPresto(Machine):
     if state.get("status") != "Idle":
       msg = state.get("message", "")
       if state.get("status") == "Busy":
-        msg += " To attach to the run and handle events, call presto.continue_run() and iterate the returned generator."
+        msg += " You are attaching to an existing protocol run. To continue driving it, use next_event(attach=True) then next_event() in a loop; or call stop_protocol() or abort() to stop."
       elif state.get("status") == "In error":
         msg += " Check error_code and error_text; you may need to call error_acknowledge()."
       warnings.warn(msg, stacklevel=2)
@@ -65,7 +61,7 @@ class KingFisherPresto(Machine):
   @need_setup_finished
   async def get_run_state(self) -> Dict[str, Any]:
     """Return instrument run state: get_status() keys plus time_left, time_to_pause, and message.
-    Idle = no protocol in progress (ready for next command). Busy = protocol in progress; call continue_run() to attach.
+    Idle = no protocol in progress (ready for next command). Busy = protocol in progress (existing run); attach to continue with next_event() or stop with stop_protocol()/abort().
     Does not warn; setup() calls this and warns when status is not Idle."""
     status_dict = await self.backend.get_status()
     status = status_dict.get("status") or "In error"
@@ -81,7 +77,7 @@ class KingFisherPresto(Machine):
     if status == "Idle":
       message = "No protocol in progress (ready for next command)."
     elif status == "Busy":
-      message = "Protocol in progress. Call continue_run() to attach to the event stream."
+      message = "Protocol in progress (existing run). Attach to continue with next_event(), or stop_protocol() or abort() to stop."
       if time_left is not None:
         message += f" Time left: {time_left}."
     else:
@@ -121,17 +117,66 @@ class KingFisherPresto(Machine):
     return await self.backend.start_protocol(protocol, tip=tip, step=step)
 
   @need_setup_finished
+  async def run_protocol(
+    self,
+    protocol: KingFisherProtocol,
+    tip_name: Optional[str] = None,
+    step_name: Optional[str] = None,
+  ) -> None:
+    """Upload the protocol and start it. Caller must drive the run with next_event() in a loop.
+
+    Build or load a KingFisherProtocol, then call run_protocol(protocol) to run the full
+    protocol, or run_protocol(protocol, step_name=\"Mix1\") to run from a specific step.
+    For single-tip protocols, when step_name is set and tip_name is None, tip_name defaults
+    to protocol.tips[0].name (protocol must have at least one tip).
+    Then loop: name, evt, ack = await next_event(); handle event (e.g. load/remove plate);
+    if ack: await ack(); stop when name is Ready, Aborted, or Error.
+    """
+    if step_name is not None and tip_name is None and len(protocol.tips) == 1:
+      tip_name = protocol.tips[0].name
+    if step_name is not None and tip_name is None and len(protocol.tips) == 0:
+      raise ValueError("Protocol has no tips; specify tip_name when running from a step.")
+    await self.upload_protocol(protocol.name, protocol.to_bdz())
+    await self.start_protocol(protocol.name, tip=tip_name, step=step_name)
+
+  @need_setup_finished
   async def stop_protocol(self) -> None:
     """Stop ongoing protocol/step execution."""
     return await self.backend.stop_protocol()
 
   @need_setup_finished
-  async def get_event(self) -> ET.Element:
-    """Return the next event from the queue. Blocks until one is available."""
-    return await self.backend.get_event()
+  async def next_event(
+    self, *, attach: bool = False
+  ) -> Tuple[str, Optional[ET.Element], Optional[Callable[..., Any]]]:
+    """Wait for the next event; returns (name, evt, ack). Single API for \"get next event\".
+
+    Blocks until the instrument sends the next event (no polling). Returns (name, evt, ack)
+    where evt is the raw XML element. Call when ready for the next event; do other work
+    (robot moves, user prompts, other instruments) between calls. For LoadPlate, RemovePlate,
+    ChangePlate, Pause call await ack() when ready so the run continues. Stop when name is
+    Ready, Aborted, or Error. Raw event stream without interpretation: use events().
+
+    When attach=True (e.g. attaching to an in-progress run after setup when Busy), if status
+    is already Idle or In error, returns (\"Ready\", None, None) without reading from the queue.
+    """
+    if attach:
+      status_dict = await self.get_status()
+      status = status_dict.get("status") or "In error"
+      if status in ("Idle", "In error"):
+        return ("Ready", None, None)
+    evt = await self.backend.get_event()
+    name = evt.get("name")
+    if name in ("LoadPlate", "RemovePlate", "ChangePlate", "Pause"):
+      return (name, evt, self.acknowledge)
+    if name == "Error":
+      return (name, evt, self.error_acknowledge)
+    if name in ("Ready", "Aborted"):
+      return (name, evt, None)
+    # Informational (StepStarted, ProtocolTimeLeft, Temperature, ChangeMagnets): no ack
+    return (name, evt, None)
 
   def events(self):
-    """Async generator of events. Use: async for evt in self.events() to orchestrate with other instruments."""
+    """Async generator of raw events (ET.Element). Use for low-level control; for (name, evt, ack) use next_event()."""
     return self.backend.events()
 
   @need_setup_finished
@@ -148,136 +193,6 @@ class KingFisherPresto(Machine):
   async def abort(self) -> None:
     """Two-phase abort: stops execution and flushes communication buffers."""
     return await self.backend.abort()
-
-  async def _event_stream_until_ready(self, attach: bool):
-    """Internal async generator of (name, evt, ack_callback) until Ready, Aborted, or Error.
-    When attach=True: if status is Idle or In error, yield (Ready, None, None) and return; if Busy, enter event loop.
-    When attach=False: go straight into event loop. Never calls stop_protocol() on exit."""
-    if attach:
-      status_dict = await self.get_status()
-      status = status_dict.get("status") or "In error"
-      if status in ("Idle", "In error"):
-        yield ("Ready", None, None)
-        return
-    async for evt in self.events():
-      name = evt.get("name")
-      if name in ("LoadPlate", "RemovePlate", "ChangePlate", "Pause"):
-        yield (name, evt, self.acknowledge)
-      elif name == "Error":
-        yield (name, evt, self.error_acknowledge)
-        return
-      elif name in ("Ready", "Aborted"):
-        yield (name, evt, None)
-        return
-      # Informational (StepStarted, ProtocolTimeLeft, Temperature, ChangeMagnets): pass through, no ack
-      else:
-        yield (name, evt, None)
-
-  def run_until_ready(self):
-    """Async generator of (name, evt, ack_callback) until Ready, Aborted, or Error.
-    Use after start_protocol() or mix()/dry()/etc. to drain events. Never stops the protocol on exit;
-    call stop_protocol() or abort() to stop. Ready (event) and Idle (get_status) both mean run complete per spec."""
-    return self._event_stream_until_ready(attach=False)
-
-  def continue_run(self):
-    """Async generator to attach to an in-progress run (same (name, evt, ack) as run_until_ready()).
-    Use after setup() when get_run_state() or the setup warning indicated Busy. Call acknowledge() or
-    error_acknowledge() when you choose; no automatic unstick."""
-    return self._event_stream_until_ready(attach=True)
-
-  async def _run_until_ready(self) -> None:
-    """Drain run_until_ready() and auto-ack; used by mix(), dry(), etc. when wait_until_ready=True."""
-    async for name, evt, ack in self.run_until_ready():
-      if ack is not None:
-        await ack()
-
-  @need_setup_finished
-  async def mix(
-    self,
-    plate: str,
-    duration_sec: float,
-    speed: str = "Medium",
-    *,
-    image: str = "Wash",
-    loop_count: int = 3,
-    wait_until_ready: bool = True,
-  ) -> None:
-    """Run a single Mix step (build .bdz, upload to plr_Mix, start, optionally wait until Ready).
-
-    Supported speeds: Medium, Fast. Unsupported: Slow, Bottom mix, Half mix.
-    """
-    slot = STEP_SLOTS["Mix"]
-    bdz_bytes = build_mix_bdz(slot, plate, duration_sec, speed, image=image, loop_count=loop_count)
-    await self.upload_protocol(slot, bdz_bytes)
-    await self.start_protocol(slot)
-    if wait_until_ready:
-      await self._run_until_ready()
-
-  @need_setup_finished
-  async def dry(
-    self,
-    duration_sec: float,
-    *,
-    plate: str = "Plate1",
-    tip_position: str = "AboveSurface",
-    wait_until_ready: bool = True,
-  ) -> None:
-    """Run a single Dry step (build .bdz, upload to plr_Dry, start, optionally wait until Ready)."""
-    slot = STEP_SLOTS["Dry"]
-    bdz_bytes = build_dry_bdz(slot, duration_sec, plate_name=plate, tip_position=tip_position)
-    await self.upload_protocol(slot, bdz_bytes)
-    await self.start_protocol(slot)
-    if wait_until_ready:
-      await self._run_until_ready()
-
-  @need_setup_finished
-  async def collect_beads(
-    self,
-    *,
-    count: int = 3,
-    collect_time_sec: float = 30,
-    plate: str = "Plate1",
-    wait_until_ready: bool = True,
-  ) -> None:
-    """Run a single CollectBeads step (build .bdz, upload to plr_CollectBeads, start, optionally wait until Ready). Count 1..5."""
-    slot = STEP_SLOTS["CollectBeads"]
-    bdz_bytes = build_collect_beads_bdz(slot, count, collect_time_sec, plate_name=plate)
-    await self.upload_protocol(slot, bdz_bytes)
-    await self.start_protocol(slot)
-    if wait_until_ready:
-      await self._run_until_ready()
-
-  @need_setup_finished
-  async def release_beads(
-    self,
-    duration_sec: float,
-    *,
-    speed: str = "Fast",
-    plate: str = "Plate1",
-    wait_until_ready: bool = True,
-  ) -> None:
-    """Run a single ReleaseBeads step (build .bdz, upload to plr_ReleaseBeads, start, optionally wait until Ready)."""
-    slot = STEP_SLOTS["ReleaseBeads"]
-    bdz_bytes = build_release_beads_bdz(slot, duration_sec, speed, plate_name=plate)
-    await self.upload_protocol(slot, bdz_bytes)
-    await self.start_protocol(slot)
-    if wait_until_ready:
-      await self._run_until_ready()
-
-  @need_setup_finished
-  async def pause(
-    self,
-    *,
-    message: str = "",
-    wait_until_ready: bool = True,
-  ) -> None:
-    """Run a single Pause step (build .bdz, upload to plr_Pause, start, optionally wait until Ready)."""
-    slot = STEP_SLOTS["Pause"]
-    bdz_bytes = build_pause_bdz(slot, message)
-    await self.upload_protocol(slot, bdz_bytes)
-    await self.start_protocol(slot)
-    if wait_until_ready:
-      await self._run_until_ready()
 
   @need_setup_finished
   async def rotate(
@@ -311,24 +226,6 @@ class KingFisherPresto(Machine):
     if state is unknown. For explicit control use rotate() and get_turntable_state().
     """
     await self.backend.load_plate()
-
-  @need_setup_finished
-  async def pick_up_tips(self) -> None:
-    """Run a single PickUpTips step (build .bdz, upload, start, wait for Ready).
-
-    Not yet implemented; requires PickUpTips step XML and build_pick_up_tips_bdz() in bdz_builder.
-    Until then use start_protocol(protocol, tip=..., step=...) with a protocol that has a tip pickup step.
-    """
-    await self.backend.pick_up_tips()
-
-  @need_setup_finished
-  async def drop_tips(self) -> None:
-    """Run a single DropTips step (build .bdz, upload, start, wait for Ready).
-
-    Not yet implemented; requires DropTips step XML and build_drop_tips_bdz() in bdz_builder.
-    Until then use start_protocol(protocol, tip=..., step=...) with a protocol that has a drop-tips step.
-    """
-    await self.backend.drop_tips()
 
   @property
   def instrument(self) -> Optional[str]:

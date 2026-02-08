@@ -8,15 +8,15 @@ Control the **KingFisher Presto** magnetic particle processor from Python over U
 
 | Layer | Role |
 |-------|------|
-| **KingFisherPresto** (frontend) | High-level API: setup/stop, status, turntable, single-step commands (mix, dry, pause, etc.), protocol start/upload/download, event handling. Enforces “setup finished” and Machine lifecycle. |
+| **KingFisherPresto** (frontend) | High-level API: setup/stop, status, turntable, protocol-based run (`run_protocol(protocol)`), protocol start/upload/download, event handling. Enforces “setup finished” and Machine lifecycle. |
 | **KingFisherPrestoBackend** | Same async operations; no lifecycle checks. Use directly if you prefer. |
 | **Connection** | USB HID (VID `0x0AB6`, PID `0x02C9`). XML Cmd/Res/Evt over 64-byte reports. One command in flight; events queued. |
 
 **Control modes**
 
 - **Direct commands** — Turntable **Rotate** (no protocol). Backend waits for Ready/Error.
-- **Single-step PLR commands** — Build a minimal .bdz, upload to a slot, start, wait for Ready (e.g. `mix()`, `dry()`, `pause()`).
-- **Multi-step BindIt protocols** — Upload or use existing protocol; `start_protocol(name)` then handle **LoadPlate**, **RemovePlate**, **ChangePlate**, **Pause** by calling **Acknowledge** so the run continues.
+- **Protocol-based run** — Build or load a `KingFisherProtocol`, then `run_protocol(protocol)` (or `run_protocol(protocol, step_name=...)`) to upload and start; the caller **must** drive the run with **`next_event()`** in a loop: handle each event (LoadPlate, RemovePlate, etc.), call **Acknowledge** when required, stop when Ready/Aborted/Error.
+- **Multi-step BindIt protocols** — Same control flow: after `run_protocol(protocol)` or `start_protocol(name)`, loop on `next_event()` and handle each event (load/remove plate, etc.), then `await ack()` when required so the run continues.
 
 **Requirements:** KingFisher Presto on USB; Python `hidapi` (e.g. `pip install hidapi`). See KingFisher Presto Interface Specification for VID/PID and protocol details.
 
@@ -35,7 +35,7 @@ Control the **KingFisher Presto** magnetic particle processor from Python over U
 
 - **Turntable state** — Reset to **unknown** at the start of every `setup()` (and cleared again in `stop()`). So after connect or reconnect we do not assume which position (1 or 2) is at processing or loading until you run a successful **Rotate** (or use `initialize_turntable=True`; see below).
 - **`initialize_turntable`** — Optional: `await presto.setup(initialize_turntable=True)`. After Connect, the backend runs `rotate(position=1, location="processing")` so the turntable is in a known power-on state (position 1 at processing, position 2 at loading). The table may move on connect. Default is `False` so we do not move the table unless you opt in.
-- **Run state on connect** — The frontend calls `get_run_state()` after setup and warns if the instrument is not Idle (e.g. Busy or In error). If Busy, you can attach with `continue_run()`.
+- **Run state on connect** — The frontend calls `get_run_state()` after setup and warns if the instrument is not Idle (e.g. Busy or In error). If Busy, you are attaching to an **existing protocol run**; you can continue driving it with `next_event(attach=True)` then `next_event()` in a loop, or call `stop_protocol()` or `abort()` to stop it.
 
 
 ### Example: connect and disconnect
@@ -88,41 +88,49 @@ await presto.rotate(position=1, location="processing")
 await presto.load_plate()  # if state known: bring plate at loading to processing
 ```
 
-### Single-step commands (WIP)
+### Running protocols
 
-Each builds a minimal .bdz, uploads to a slot (e.g. `plr_Mix`, `plr_Pause`), starts the protocol, and optionally waits for Ready.
+The main way to run is to build or load a **KingFisherProtocol** (from `kingfisher_protocol`) and call **`run_protocol(protocol)`**. This uploads the protocol (as `protocol.to_bdz()`) and starts it. You then **must** drive the run with **`next_event()`** in a loop: handle each event (LoadPlate, RemovePlate, etc.), call `await ack()` when required, stop when Ready/Aborted/Error. To run from a specific step, use `run_protocol(protocol, tip_name="Tip1", step_name="Mix1")`. For single-tip protocols you can pass only `step_name`; the tip defaults to the protocol’s single tip.
 
 | Method | Description |
 |--------|-------------|
-| `await presto.pause(message="...")` | Single Pause step. |
-| `await presto.mix(plate, duration_sec, speed="Medium"\|"Fast", ...)` | Single Mix step. Speeds: Medium, Fast. |
-| `await presto.dry(duration_sec, plate="Plate1", tip_position="AboveSurface", ...)` | Single Dry step. |
-| `await presto.collect_beads(count=3, collect_time_sec=30, plate="Plate1", ...)` | Single CollectBeads step (count 1..5). |
-| `await presto.release_beads(duration_sec, speed="Fast", plate="Plate1", ...)` | Single ReleaseBeads step. |
+| `await presto.run_protocol(protocol, tip_name=None, step_name=None)` | Upload `protocol.to_bdz()` as `protocol.name`, start the protocol (optionally from tip/step). Caller then loops `next_event()` until Ready/Aborted/Error. |
+| `await presto.start_protocol(name, tip=None, step=None)` | Start a protocol already in instrument memory (e.g. after upload). Use for low-level control or when you uploaded separately. Caller then loops `next_event()` until Ready/Aborted/Error. |
 
-**Sync (block until Ready):** Default `wait_until_ready=True`. The call returns when the step has completed.
+**Example: build a protocol and run it (run_protocol then next_event loop)**
 
 ```python
-await presto.pause(message="Demo")
-await presto.mix("Plate1", 10.0, speed="Medium")
-await presto.dry(30.0, plate="Plate1")
+from pylabrobot.particle_processing.kingfisher import KingFisherPresto, KingFisherPrestoBackend
+from pylabrobot.particle_processing.kingfisher.kingfisher_protocol import (
+    KingFisherProtocol, Plate, PlateType, Tip, Image,
+)
+
+# Build a minimal protocol (one tip, one Mix step)
+p = KingFisherProtocol(name="MyRun")
+p.add_tip(Tip(name="Tip1", plate=Plate.create("Tips", PlateType.TIPS_96), steps=[]))
+p.add_plate(Plate.create("96 DWP", PlateType.DWP_96))
+p.add_mix("Mix1", "96 DWP", image=Image.Heating, loop_count=3)
+
+# Run the full protocol: upload + start, then drive the run with next_event()
+await presto.run_protocol(p)
+while True:
+    name, evt, ack = await presto.next_event()
+    if name not in ("Ready", "Aborted", "Error") and ack is not None:
+        await ack()
+    if name in ("Ready", "Aborted", "Error"):
+        break
+
+# Or run from a specific step (single-tip: tip_name defaults); same pattern
+await presto.run_protocol(p, step_name="Mix1")
+while True:
+    name, evt, ack = await presto.next_event()
+    if name not in ("Ready", "Aborted", "Error") and ack is not None:
+        await ack()
+    if name in ("Ready", "Aborted", "Error"):
+        break
 ```
 
-**Async (fire-and-forget):** Set `wait_until_ready=False`; the call returns as soon as the step is started. Handle events (e.g. LoadPlate, Ready) yourself via `run_until_ready()` or `events()`.
-
-```python
-await presto.mix("Wash1", 5.0, wait_until_ready=False)
-# later: async for name, evt, ack in presto.run_until_ready():
-#     if ack: await ack()
-#     if name in ("Ready", "Error"): break
-```
-
-### Single-step commands (planned)
-
-| Method | Status | Workaround |
-|--------|--------|------------|
-| `await presto.pick_up_tips()` | Not implemented (raises `NotImplementedError`) | Use `start_protocol(protocol, tip=..., step=...)` with a protocol that has a tip pickup step. |
-| `await presto.drop_tips()` | Not implemented (raises `NotImplementedError`) | Use `start_protocol(protocol, tip=..., step=...)` with a protocol that has a drop-tips step. |
+**Pick-up and leave:** Tip pick-up and leave are implicit in every protocol (defined by each Tip’s plates and steps). There are no separate `pick_up_tips()` or `drop_tips()` methods; use `run_protocol(protocol)` with a full protocol.
 
 ---
 
@@ -156,32 +164,54 @@ with open("backup.bdz", "wb") as f:
     f.write(raw)
 ```
 
-Single-step PLR commands (mix, dry, etc.) upload to fixed slot names (e.g. `plr_Mix`, `plr_Pause`) and then start that protocol; they overwrite any existing protocol with that name.
+Use `run_protocol(protocol)` to upload the protocol under `protocol.name` and start it; that overwrites any existing protocol with that name in instrument memory.
 
 ---
 
 ## 5. Multi-step BindIt protocols: run and control with Acknowledge and events
 
-Protocols authored in BindIt (or uploaded as .bdz) can have multiple steps and require **Acknowledge** for **LoadPlate**, **RemovePlate**, **ChangePlate**, and **Pause** events. You run them with `start_protocol()` and drive progress by consuming the event stream and calling `acknowledge()` (or `error_acknowledge()` on **Error**).
+Protocols authored in BindIt (or uploaded as .bdz) can have multiple steps and require **Acknowledge** for **LoadPlate**, **RemovePlate**, **ChangePlate**, and **Pause** events. After `run_protocol(protocol)` or `start_protocol(name)`, drive the run with **`next_event()`** in a loop: handle each event (e.g. load/remove plate, move robot), call `await ack()` when required, stop when Ready/Aborted/Error.
 
 ### Start a full protocol or a single tip/step
 
-- **Full protocol:** `await presto.start_protocol("My Protocol")`
-- **Single tip/step:** `await presto.start_protocol("My Protocol", tip="Tip1", step="Step1")`
-  The protocol must already be in instrument memory (e.g. uploaded via BindIt or `upload_protocol`).
+- **Preferred:** Build a `KingFisherProtocol` and call `await presto.run_protocol(protocol)` (uploads and starts). Then loop `next_event()` until Ready/Aborted/Error. To run from a step: `run_protocol(protocol, step_name="Mix1")` or `run_protocol(protocol, tip_name="Tip1", step_name="Mix1")`, then same loop.
+- **Low-level:** After uploading (e.g. via BindIt or `upload_protocol`), use `await presto.start_protocol("My Protocol")` for full run or `await presto.start_protocol("My Protocol", tip="Tip1", step="Step1")` for a single tip/step. Then loop `next_event()` until Ready/Aborted/Error. The protocol must already be in instrument memory.
 
-### Event stream and Acknowledge
+### Event handling and Acknowledge
 
-After starting, the instrument sends events. You must **acknowledge** when required or the run will not advance.
+After starting, the instrument sends events. You must **handle** each event and **acknowledge** when required or the run will not advance. Loop on `next_event()`: for LoadPlate/RemovePlate/ChangePlate/Pause do your work (load plate, move robot, etc.), then `await ack()`; for Error call `await ack()` (error_acknowledge); stop when name is Ready, Aborted, or Error.
 
 | Event | Action |
 |-------|--------|
-| **LoadPlate**, **RemovePlate**, **ChangePlate**, **Pause** | Call `await presto.acknowledge()` so the instrument continues. |
-| **Error** | Call `await presto.error_acknowledge()`; inspect `evt.find("Error")` for code/text. |
+| **LoadPlate**, **RemovePlate**, **ChangePlate**, **Pause** | Do your work (load/remove plate, robot, user), then `await ack()` so the instrument continues. |
+| **Error** | Call `await ack()` (error_acknowledge); inspect `evt.find("Error")` for code/text. |
 | **Ready** | Run completed successfully. |
 | **Aborted** | Run aborted. |
 
-**Option A — Async iterator over events (recommended):**
+**Primary pattern — next_event() in a loop:**
+
+```python
+await presto.run_protocol(protocol)  # or start_protocol("My Protocol")
+
+while True:
+    name, evt, ack = await presto.next_event()
+    if name == "LoadPlate":
+        # ... do your work: load plate, move robot, prompt user ...
+        if ack is not None:
+            await ack()
+    elif name in ("RemovePlate", "ChangePlate", "Pause"):
+        # ... handle and ack when ready ...
+        if ack is not None:
+            await ack()
+    elif name == "Error":
+        if ack is not None:
+            await ack()
+        break
+    if name in ("Ready", "Aborted", "Error"):
+        break
+```
+
+**Option B — Raw async iterator over events (low-level):**
 
 ```python
 await presto.start_protocol("My Protocol")
@@ -214,28 +244,20 @@ async for evt in presto.events():
         break
 ```
 
-**Option B — Helper generator `run_until_ready()` (name, evt, ack callback):**
+**Option C — Attach to an existing protocol run:**
+
+If after `setup()` the instrument is **Busy**, you are attaching to an **existing protocol run** (e.g. after a restart or re-setup). You can **continue** driving it with `next_event(attach=True)` then `next_event()` in a loop, or **stop** it with `stop_protocol()` or `abort()`. To continue, call `next_event(attach=True)` first, then loop with `next_event()`:
 
 ```python
-await presto.start_protocol("My Protocol")
-
-async for name, evt, ack in presto.run_until_ready():
-    if ack is not None:
-        await ack()
-    if name in ("Ready", "Aborted", "Error"):
-        break
-```
-
-**Option C — Attach to an already-running protocol (`continue_run()`):**
-
-If after `setup()` the instrument is **Busy**, use `continue_run()` to attach to the same event stream (e.g. after a restart or re-setup):
-
-```python
-async for name, evt, ack in presto.continue_run():
-    if ack is not None:
-        await ack()
-    if name in ("Ready", "Aborted", "Error"):
-        break
+name, evt, ack = await presto.next_event(attach=True)
+if name not in ("Ready", "Aborted", "Error"):
+    while True:
+        # handle (name, evt, ack) ...
+        if ack is not None:
+            await ack()
+        name, evt, ack = await presto.next_event()
+        if name in ("Ready", "Aborted", "Error"):
+            break
 ```
 
 Events are XML elements; use `evt.get("name")`, `evt.get("plate")`, `evt.find("Error")`, etc. See the KingFisher Presto Interface Specification for the full event list and attributes.
@@ -252,7 +274,7 @@ Events are XML elements; use `evt.get("name")`, `evt.get("plate")`, `evt.find("E
 
 ## Step-by-step notebook
 
-[**kingfisher_presto_step_by_step.ipynb**](kingfisher_presto_step_by_step.ipynb) walks through connect, status, turntable, single-step commands, and tip pickup/drop (via protocol step) in separate cells.
+[**kingfisher_presto_step_by_step.ipynb**](kingfisher_presto_step_by_step.ipynb) walks through connect, status, turntable, and running protocols with `run_protocol(protocol)`. Tip pick-up and leave are implicit in every protocol (defined by each Tip’s plates and steps).
 
 ---
 

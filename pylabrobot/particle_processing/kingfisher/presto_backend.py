@@ -198,7 +198,8 @@ class KingFisherPrestoBackend(MachineBackend):
     await self._conn.send_command(cmd)
 
   async def get_event(self) -> ET.Element:
-    """Return the next event from the queue. Blocks until one is available."""
+    """Return the next raw event from the queue. Blocks until one is available.
+    Internal: used by frontend next_event() and by backend rotate(). Prefer frontend next_event() for (name, evt, ack)."""
     return await self._conn.get_event()
 
   def events(self):
@@ -294,30 +295,6 @@ class KingFisherPrestoBackend(MachineBackend):
       raise ValueError("Turntable state unknown; call rotate() first to establish state.")
     position_at_loading = 3 - self._position_at_processing
     await self.rotate(position=position_at_loading, location=TurntableLocation.PROCESSING)
-
-  async def pick_up_tips(self) -> None:
-    """Run a single PickUpTips step (build .bdz, upload, start, wait for Ready).
-
-    Not yet implemented: requires reverse-engineering the PickUpTips step XML from a
-    real .bdz or spec and adding build_pick_up_tips_bdz() to bdz_builder.py. Until then,
-    use start_protocol(protocol, tip=..., step=...) with a protocol that has a tip pickup step.
-    """
-    raise NotImplementedError(
-      "pick_up_tips() not yet implemented; need PickUpTips step XML and build_pick_up_tips_bdz() in bdz_builder. "
-      "Use start_protocol(protocol, tip=..., step=...) with a protocol that has a tip pickup step."
-    )
-
-  async def drop_tips(self) -> None:
-    """Run a single DropTips step (build .bdz, upload, start, wait for Ready).
-
-    Not yet implemented: requires reverse-engineering the DropTips step XML from a
-    real .bdz or spec and adding build_drop_tips_bdz() to bdz_builder.py. Until then,
-    use start_protocol(protocol, tip=..., step=...) with a protocol that has a drop-tips step.
-    """
-    raise NotImplementedError(
-      "drop_tips() not yet implemented; need DropTips step XML and build_drop_tips_bdz() in bdz_builder. "
-      "Use start_protocol(protocol, tip=..., step=...) with a protocol that has a drop-tips step."
-    )
 
   @property
   def instrument(self) -> Optional[str]:
