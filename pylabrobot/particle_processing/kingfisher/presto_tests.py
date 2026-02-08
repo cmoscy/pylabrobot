@@ -7,7 +7,6 @@ Tests BDZ builder output structure and high-level step methods (mix, dry, etc.).
 """
 
 import asyncio
-import gzip
 import binascii
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -477,16 +476,9 @@ class TestProtocolCrc32:
 
 
 def _decompress_bdz_blocks(bdz: bytes) -> tuple[bytes, bytes]:
-  """Return (properties_xml, exported_data_xml) from .bdz bytes. Header = 61 bytes."""
-  assert bdz[:4] == bytes.fromhex("b6751cf2"), "bad magic"
-  rest = bdz[61:]
-  assert rest[:2] == b"\x1f\x8b", "first block not gzip"
-  # Second gzip block starts at next 1f 8b (skip first occurrence)
-  idx = rest.find(b"\x1f\x8b", 2)
-  assert idx > 0, "no second gzip block"
-  dec1 = gzip.decompress(rest[:idx])
-  dec2 = gzip.decompress(rest[idx:])
-  return (dec1, dec2)
+  """Return (properties_xml, exported_data_xml) from .bdz bytes. Uses canonical reader."""
+  from .bdz_builder import decompress_bdz
+  return decompress_bdz(bdz)
 
 
 class TestBdzBuilder:

@@ -256,6 +256,20 @@ Events are XML elements; use `evt.get("name")`, `evt.get("plate")`, `evt.find("E
 
 ---
 
+## BDZ file format
+
+BindIt .bdz files have a **61-byte header** followed by two gzip members (Properties XML, then ExportedData XML). Between the two gzip blocks there is a **fixed 8-byte record** in every sample we’ve seen; it is **not** padding for 64-byte alignment (payload2 start offset is not aligned, and the first member length at offset 57 is the real gzip size, not rounded to 64).
+
+Layout (see `bdz_builder.py` docstring): `[HEADER 61] [BLOCK1 gzip] [SPACER 8] [BLOCK2 gzip]`. Header = magic, version, reserved (payload/block1 sizes). Spacer = prefix `01 00 00 01` + suffix LE = `block2_len - 65` (65 = 61 + 4). Structs: `BdzHeader`, `BdzSpacer`.
+
+- **Fixed-format inter-member record** — BindIt inserts the same 8-byte structure between payload 1 and payload 2. The first 4 bytes are constant (e.g. `01 00 00 01` LE → 0x01000001); the second 4 bytes vary per file. So the spacer is part of the format, not “length rounded to 64-byte packets.”
+- **First dword** — Likely block type or version (constant 0x01000001).
+- **Second dword** — Unknown; it does not match gzip2 length, CRC32, or Adler32 of the second block. When writing .bdz (e.g. for tip-enabled variants), preserve the original 8-byte block byte-for-byte so the file matches BindIt’s layout.
+
+**Unified API:** `read_bdz(bdz)` → `(header, spacer, properties_xml, exported_data_xml)`. `write_bdz(header, spacer, properties_xml, exported_data_xml)` → bdz (always four args; no fallbacks).
+
+---
+
 ## Low-level / backend
 
 - **KingFisherPrestoBackend** exposes the same async operations without frontend lifecycle checks; use it directly if you prefer.
