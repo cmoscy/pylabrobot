@@ -7,8 +7,6 @@ See KingFisher Presto Interface Specification for Cmd/Res/Evt formats and error 
 """
 
 import asyncio
-import base64
-import binascii
 import logging
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
