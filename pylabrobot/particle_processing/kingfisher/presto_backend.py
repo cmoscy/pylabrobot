@@ -11,10 +11,11 @@ import base64
 import binascii
 import logging
 import xml.etree.ElementTree as ET
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pylabrobot.machines.backend import MachineBackend
 
+from .bdz_builder import BDZ_HEADER_LEN, BdzHeader
 from .error_codes import format_error_message, get_error_code_description
 from .presto_connection import (
   KINGFISHER_PID,
@@ -165,6 +166,33 @@ class KingFisherPrestoBackend(MachineBackend):
     time_to_pause = time_to_pause_el.get("value") if time_to_pause_el is not None else None
     return {"time_left": time_left, "time_to_pause": time_to_pause}
 
+  async def get_protocol_duration(self, protocol: str) -> Dict[str, Any]:
+    """Get protocol structure (tips and step names/durations) from the instrument.
+
+    Per Interface Spec §5.7 GetProtocolDuration: returns Init, Tip(s) with TimeStamp
+    entries (@step, @type, @duration), Finish, and Total duration. Use this to list
+    steps without downloading or parsing the BDZ.
+    """
+    res = await self._conn.send_command(_cmd_xml("GetProtocolDuration", protocol=protocol))
+    out: Dict[str, Any] = {"protocol": protocol, "total_duration": None, "tips": []}
+    total_el = res.find("Total")
+    if total_el is not None:
+      out["total_duration"] = total_el.get("duration")
+    for tip_el in res.findall("Tip"):
+      tip_name = tip_el.get("name", "")
+      steps: List[Dict[str, Optional[str]]] = []
+      for ts in tip_el.findall("TimeStamp"):
+        if ts.get("type") == "Start":
+          step_name = ts.get("step", "")
+          duration: Optional[str] = None
+          for ts2 in tip_el.findall("TimeStamp"):
+            if ts2.get("type") == "Stop" and ts2.get("step") == step_name:
+              duration = ts2.get("duration")
+              break
+          steps.append({"name": step_name, "duration": duration})
+      out["tips"].append({"name": tip_name, "steps": steps})
+    return out
+
   async def list_protocols(self) -> Tuple[List[str], int]:
     """List protocols in instrument memory. Returns (protocol_names, memory_used_percent)."""
     res = await self._conn.send_command(_cmd_xml("ListProtocols"))
@@ -178,11 +206,30 @@ class KingFisherPrestoBackend(MachineBackend):
     memory_used = int(mem_el.get("value", 0)) if mem_el is not None else 0
     return (names, memory_used)
 
-  async def download_protocol(self, name: str) -> bytes:
-    """Download a protocol from instrument memory. Returns raw protocol bytes (base64-decoded)."""
+  async def download_protocol(self, name: str, *, raw_response: bool = False) -> bytes:
+    """Download a protocol from instrument memory. Returns raw BDZ bytes.
+
+    Per Interface Spec §5.5: response is base64-encoded protocol file in CDATA.
+    Instrument response layout (observed): either (a) 24-byte prefix then gzip1,
+    spacer, gzip2, or (b) 61-byte BDZ header, 4 extra bytes, then gzip1, spacer, gzip2.
+    We normalize to a valid .bdz (61-byte header, gzip1, spacer, gzip2) for
+    read_bdz/parse_bdz_to_protocol. When raw_response is True, returns the decoded
+    bytes exactly as received (for debugging).
+    """
+    _GZIP_MAGIC = b"\x1f\x8b"
     res = await self._conn.send_command(_cmd_xml("DownloadProtocol", protocol=name))
     cdata = "".join(res.itertext()).replace(" ", "").replace("\n", "").replace("\r", "")
-    return base64.b64decode(cdata)
+    raw = base64.b64decode(cdata)
+    if raw_response:
+      return raw
+    # (a) Gzip at offset 24: instrument sent 24-byte prefix; prepend missing 37 bytes for full 61-byte header.
+    if len(raw) > BDZ_HEADER_LEN and raw[24:26] == _GZIP_MAGIC:
+      default_header = BdzHeader.default().to_bytes()
+      raw = raw[:24] + default_header[24:BDZ_HEADER_LEN] + raw[24:]
+    # (b) Gzip at offset 65: 61-byte header + 4 extra bytes; strip the 4 bytes.
+    elif len(raw) > BDZ_HEADER_LEN + 4 and raw[65:67] == _GZIP_MAGIC:
+      raw = raw[:BDZ_HEADER_LEN] + raw[BDZ_HEADER_LEN + 4:]
+    return raw
 
   async def upload_protocol(self, name: str, protocol_bytes: bytes, crc: Optional[int] = None) -> None:
     """Upload a protocol to instrument memory. crc: uint32 of BindIt protocol file data."""
@@ -252,7 +299,8 @@ class KingFisherPrestoBackend(MachineBackend):
       raise ValueError("position must be 1 or 2")
     normalized_location = _normalize_location(location)
     spec_position = 1 if normalized_location == "processing" else 2
-    await self._conn.send_command(
+    # Send Rotate without waiting for Res; instrument may signal completion only via Evt (Ready/Error).
+    await self._conn.send_without_response(
       _cmd_xml("Rotate", nest=str(position), position=str(spec_position))
     )
     while True:

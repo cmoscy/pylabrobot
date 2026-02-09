@@ -14,7 +14,6 @@ from typing import Any
 
 from .bdz_builder import (
     BdzHeader,
-    BdzSpacer,
     INSTRUMENT_TYPE_ID,
     POSTMIX_SPEED_GUID,
     SPEED_GUIDS,
@@ -447,8 +446,11 @@ def _build_plate_layout_xml(
   protocol_name: str,
   plates: list[Plate],
   plate_id_by_name: dict[str, str],
+  group_id_by_name: dict[str, str] | None = None,
 ) -> ET.Element:
   """Build PlateLayout element: ID, Name, Plates with Wells/Group/Region."""
+  if group_id_by_name is None:
+    group_id_by_name = {}
   layout_id = guid(f"plate_layout:{protocol_name}")
   plate_layout = ET.Element("PlateLayout", ID=layout_id, Name="No name")
   plate_layout.append(ET.Element("Description"))
@@ -464,39 +466,43 @@ def _build_plate_layout_xml(
     )
     wells = ET.SubElement(pe, "Wells")
     group_id = guid(f"group:{protocol_name}:{plate.name}")
+    group_id_by_name[plate.name] = group_id
     gr = ET.SubElement(wells, "Group", ID=group_id, name="Plate")
     ET.SubElement(gr, "Region", x="0", y="0", columns=str(plate.plate_type.columns), rows=str(plate.plate_type.rows))
   return plate_layout
 
 
-def _build_properties_xml(protocol_name: str) -> str:
-  """Minimal Properties XML (block 1)."""
-  obj_id = guid(f"properties:{protocol_name}")
-  return f"""<?xml version="1.0" encoding="utf-8"?>
-<Properties version="1">
-  <ExportedObject name="{protocol_name}" id="{obj_id}">
-    <InstrumentTypeId>{INSTRUMENT_TYPE_ID}</InstrumentTypeId>
-    <CreatorName>pylabrobot</CreatorName>
-    <Timestamp>0001-01-01T00:00:00</Timestamp>
-    <ExecutionTime>0001-01-01T00:00:00</ExecutionTime>
-  </ExportedObject>
-  <Flags><FactoryData>false</FactoryData></Flags>
-  <InstrumentParameters type="713"><ProtocolType>1</ProtocolType></InstrumentParameters>
-</Properties>"""
+def _build_properties_xml(protocol_name: str, run_id: str | None = None) -> str:
+  """Properties XML for block1. Structure follows BDZ build spec (bdz_builder docstring): Properties > ExportedObject, Flags, InstrumentParameters.
+  If run_id is provided, use it for ExportedObject @id so it matches Run @ID and Protocol @ID in ExportedData (BindIt expects these to match)."""
+  obj_id = run_id if run_id else guid(f"properties:{protocol_name}")
+  return (
+    f'<Properties version="1">'
+    f'<ExportedObject name="{protocol_name}" id="{obj_id}">'
+    f"<InstrumentTypeId>{INSTRUMENT_TYPE_ID}</InstrumentTypeId>"
+    f"<CreatorName>pylabrobot</CreatorName>"
+    f"<Timestamp>0001-01-01T00:00:00</Timestamp>"
+    f"<ExecutionTime>0001-01-01T00:00:00</ExecutionTime>"
+    f"</ExportedObject>"
+    f"<Flags><FactoryData>false</FactoryData></Flags>"
+    f'<InstrumentParameters type="713" oemTypeId="00000000-0000-0000-0000-000000000000"><ProtocolType>1</ProtocolType></InstrumentParameters>'
+    f"</Properties>"
+  )
 
 
-def _build_exported_data_xml(protocol: "KingFisherProtocol") -> bytes:
-  """Build full ExportedData XML as bytes (UTF-8)."""
+def _build_exported_data_xml(protocol: "KingFisherProtocol", run_id: str | None = None) -> bytes:
+  """Build full ExportedData XML as bytes (UTF-8). If run_id is provided, use it for Run @ID and Protocol @ID (BindIt expects these to match Properties/ExportedObject @id)."""
   plate_id_by_name: dict[str, str] = {}
-  run_id = guid(f"run:{protocol.name}")
-  protocol_id = guid(f"protocol:{protocol.name}")
+  group_id_by_name: dict[str, str] = {}
+  run_id = run_id or guid(f"run:{protocol.name}")
+  protocol_id = run_id  # BindIt expects Protocol @ID == Run @ID == Properties ExportedObject @id
 
   root = ET.Element("ExportedData")
   root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
   root.set("xmlns:xsd", "http://www.w3.org/2001/XMLSchema")
   protocol_outer = ET.SubElement(root, "Protocol")
   run = ET.SubElement(protocol_outer, "Run", ID=run_id)
-  run.append(_build_plate_layout_xml(protocol.name, protocol.plates, plate_id_by_name))
+  run.append(_build_plate_layout_xml(protocol.name, protocol.plates, plate_id_by_name, group_id_by_name))
 
   run_spec = ET.SubElement(run, "RunSpecificInformation", Locked="false")
   si = ET.SubElement(run_spec, "SampleInformation")
@@ -531,12 +537,32 @@ def _build_exported_data_xml(protocol: "KingFisherProtocol") -> bytes:
 
   protocol_el = ET.SubElement(
     run, "Protocol",
-    name=protocol.name, ID=protocol_id, locked="false", IsExecutable="true", enabled="true",
-  )
+    name=protocol.name, ID=protocol_id, locked="false", IsExecutable="false", enabled="true",
+  )  # protocol_id == run_id so BindIt sees consistent top-level ID
   ET.SubElement(protocol_el, "KitName")
   ET.SubElement(protocol_el, "RemovePlateMessage")
   ET.SubElement(protocol_el, "ProtocolType").text = "Normal"
-  protocol_el.append(ET.Element("Containers"))
+  # Plates that get a Container: all except tip plate(s). Volume on Plate is required for correct heights on mixing/other steps.
+  tip_plate_names = {
+    (tip.plate.name if isinstance(tip.plate, Plate) else tip.plate) for tip in protocol.tips
+  }
+  plates_for_containers = [p for p in protocol.plates if p.name not in tip_plate_names]
+  containers_el = ET.SubElement(protocol_el, "Containers")
+  for plate in plates_for_containers:
+    container_id = guid(f"container:{protocol.name}:{plate.name}")
+    group_id = group_id_by_name.get(plate.name, guid(f"group:{protocol.name}:{plate.name}"))
+    container_el = ET.SubElement(containers_el, "Container", id=container_id, groupId=group_id)
+    contents_el = ET.SubElement(container_el, "Contents")
+    reagent_id = guid(f"reagent:{protocol.name}:{plate.name}")
+    reagent_name = plate.reagent_name if plate.reagent_name is not None else "None"
+    reagent_volume = plate.volume if plate.volume is not None else 0
+    volume_str = str(int(reagent_volume)) if reagent_volume == int(reagent_volume) else str(reagent_volume)
+    reagent_color = plate.color if plate.color is not None else "ffff0000"
+    reagent_type = plate.reagent_type if plate.reagent_type is not None else "Other"
+    ET.SubElement(
+      contents_el, "Reagent",
+      id=reagent_id, name=reagent_name, volume=volume_str, color=reagent_color, type=reagent_type,
+    )
   ET.SubElement(protocol_el, "LegacySpeeds")
   ET.SubElement(protocol_el, "InstrumentTypeID").text = INSTRUMENT_TYPE_ID
   ET.SubElement(protocol_el, "Description")
@@ -567,7 +593,7 @@ def _build_exported_data_xml(protocol: "KingFisherProtocol") -> bytes:
       steps_el.append(step_to_xml_element(step, pid, wg))
 
   root.append(ET.Element("RunLog"))
-  return ET.tostring(root, encoding="utf-8", method="xml", xml_declaration=True)
+  return ET.tostring(root, encoding="utf-8", method="xml", xml_declaration=False)
 
 
 # --- KingFisherProtocol ---
@@ -626,6 +652,8 @@ class KingFisherProtocol:
     tip_name: str | None = None,
     enabled: bool = True,
   ) -> CollectBeadsStep:
+    if not 1 <= count <= 5:
+      raise ValueError("Collect beads count must be 1..5")
     plate_id, plate_ref = _resolve_plate_for_step(self, plate_name_or_plate)
     step = CollectBeadsStep(
       name=name, enabled=enabled, plate_ref=plate_ref, count=count, collect_time_sec=collect_time_sec,
@@ -732,10 +760,12 @@ class KingFisherProtocol:
     return step
 
   def to_bdz(self) -> bytes:
-    """Build Properties + ExportedData and return full .bdz bytes."""
-    properties_xml = _build_properties_xml(self.name)
-    exported_data_xml = _build_exported_data_xml(self)
-    return write_bdz(BdzHeader.default(), BdzSpacer.default(), properties_xml, exported_data_xml)
+    """Build BDZ bytes from this protocol (header, Properties, ExportedData built from scratch per BDZ build spec in bdz_builder).
+    Uses a single run_id for Properties/ExportedObject @id, Run @ID, and Protocol @ID so BindIt can parse the file."""
+    run_id = guid(f"run:{self.name}")
+    properties_xml = _build_properties_xml(self.name, run_id=run_id)
+    exported_data_xml = _build_exported_data_xml(self, run_id=run_id)
+    return write_bdz(BdzHeader.default(), properties_xml, exported_data_xml)
 
 
 def _resolve_plate_for_step(
@@ -774,6 +804,7 @@ def parse_bdz_to_protocol(bdz: bytes) -> KingFisherProtocol:
 
   plates: list[Plate] = []
   plate_id_to_plate: dict[str, Plate] = {}
+  group_id_to_plate: dict[str, Plate] = {}
   plate_layout = root.find(".//PlateLayout")
   if plate_layout is not None:
     for pe in plate_layout.findall(".//Plates/Plate"):
@@ -792,6 +823,43 @@ def parse_bdz_to_protocol(bdz: bytes) -> KingFisherProtocol:
       plates.append(plate)
       if pid:
         plate_id_to_plate[pid] = plate
+      group_el = pe.find(".//Group") or pe.find("Wells/Group")
+      if group_el is not None:
+        gid = group_el.get("ID") or group_el.get("id")
+        if gid:
+          group_id_to_plate[gid] = plate
+
+  # Apply Container/Reagent data to plates (volume, reagent_name, color, reagent_type) so roundtrip preserves them.
+  containers_el = protocol_el.find("Containers")
+  if containers_el is not None:
+    for cont in containers_el.findall("Container"):
+      group_id = cont.get("groupId")
+      if not group_id:
+        continue
+      plate = group_id_to_plate.get(group_id)
+      if plate is None:
+        continue
+      contents = cont.find("Contents")
+      if contents is None:
+        continue
+      reagent = contents.find("Reagent")
+      if reagent is None:
+        continue
+      vol = reagent.get("volume")
+      if vol is not None:
+        try:
+          plate.volume = float(vol)
+        except ValueError:
+          pass
+      name_attr = reagent.get("name")
+      if name_attr is not None:
+        plate.reagent_name = name_attr if name_attr != "None" else None
+      color_attr = reagent.get("color")
+      if color_attr is not None:
+        plate.color = color_attr
+      type_attr = reagent.get("type")
+      if type_attr is not None:
+        plate.reagent_type = type_attr
 
   tips: list[Tip] = []
   steps_outer = root.find(".//Protocol/Steps")

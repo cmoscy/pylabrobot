@@ -223,6 +223,17 @@ class PrestoConnection:
           raise PrestoConnectionError(message, code=code, res_name=res.get("name"))
       return res
 
+  async def send_without_response(self, cmd_xml: str) -> None:
+    """Send a <Cmd> XML string without waiting for <Res>. Use for Rotate when completion is signaled by Evt (Ready/Error).
+
+    Holds the send lock so no other command is in flight. Any Res that arrives for this
+    command is treated as orphaned (logged). Caller should then wait for completion via get_event().
+    """
+    async with self._send_lock:
+      if self._pending_future is not None and not self._pending_future.done():
+        await self._pending_future
+      await self._send_payload(cmd_xml.encode("utf-8"))
+
   async def get_event(self) -> ET.Element:
     """Return the next event from the queue. Blocks until one is available."""
     return await self._event_queue.get()

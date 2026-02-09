@@ -3,10 +3,9 @@
 Same lifecycle as other machines (setup(), stop(), async with).
 Exposes start_protocol(), get_status(), acknowledge(), error_acknowledge(),
 next_event() for the next (name, evt, ack), and events() for a raw event stream.
-Main way to run: build or load a KingFisherProtocol and call run_protocol(protocol)
-to upload and start; then drive the run by calling next_event() in a loop. Handle each
-event (LoadPlate, RemovePlate, ChangePlate, Pause, etc.), do your work (robot, user),
-then await ack() when required. Stop when name is Ready, Aborted, or Error.
+Main way to run: build or load a KingFisherProtocol, call upload_protocol(protocol)
+to upload it (conversion to .bdz happens inside), then start_protocol(protocol.name, tip=..., step=...).
+Drive the run with next_event() in a loop; handle each event, await ack() when required; stop when Ready/Aborted/Error.
 """
 
 import warnings
@@ -92,18 +91,40 @@ class KingFisherPresto(Machine):
     return result
 
   @need_setup_finished
+  async def get_protocol_duration(self, protocol: str) -> Dict[str, Any]:
+    """Get protocol structure (tips and step names/durations) from the instrument.
+
+    Per Interface Spec §5.7 GetProtocolDuration. Use this to list steps without
+    downloading or parsing the BDZ. Returns dict with protocol, total_duration,
+    and tips (each with name and steps list of {name, duration})."""
+    return await self.backend.get_protocol_duration(protocol)
+
+  @need_setup_finished
   async def list_protocols(self) -> Tuple[List[str], int]:
     """List protocols in instrument memory. Returns (protocol_names, memory_used_percent)."""
     return await self.backend.list_protocols()
 
   @need_setup_finished
-  async def download_protocol(self, name: str) -> bytes:
-    """Download a protocol from instrument memory. Returns raw protocol bytes."""
-    return await self.backend.download_protocol(name)
+  async def download_protocol(self, name: str, *, raw_response: bool = False) -> bytes:
+    """Download a protocol from instrument memory. Returns raw protocol bytes.
+    When raw_response is True, returns bytes exactly as received (for debugging).
+    """
+    return await self.backend.download_protocol(name, raw_response=raw_response)
 
   @need_setup_finished
-  async def upload_protocol(self, name: str, protocol_bytes: bytes, crc: Optional[int] = None) -> None:
-    """Upload a protocol to instrument memory. crc optional (default: computed from bytes)."""
+  async def upload_protocol(self, protocol: KingFisherProtocol) -> None:
+    """Upload a protocol to instrument memory. Conversion to .bdz is done here (protocol.to_bdz()).
+
+    Overwrites any existing protocol in instrument memory with the same name. For raw bytes
+    use upload_protocol_bytes(name, protocol_bytes, crc=None).
+    """
+    await self.backend.upload_protocol(protocol.name, protocol.to_bdz())
+
+  @need_setup_finished
+  async def upload_protocol_bytes(
+    self, name: str, protocol_bytes: bytes, crc: Optional[int] = None
+  ) -> None:
+    """Upload raw protocol bytes to instrument memory. crc optional (default: computed from bytes)."""
     return await self.backend.upload_protocol(name, protocol_bytes, crc=crc)
 
   @need_setup_finished
@@ -113,48 +134,52 @@ class KingFisherPresto(Machine):
     tip: Optional[str] = None,
     step: Optional[str] = None,
   ) -> None:
-    """Start a protocol or single step. Protocol must already be in instrument memory."""
+    """Start a protocol or single step. Protocol must already be in instrument memory (upload first)."""
     return await self.backend.start_protocol(protocol, tip=tip, step=step)
-
-  @need_setup_finished
-  async def run_protocol(
-    self,
-    protocol: KingFisherProtocol,
-    tip_name: Optional[str] = None,
-    step_name: Optional[str] = None,
-  ) -> None:
-    """Upload the protocol and start it. Caller must drive the run with next_event() in a loop.
-
-    Build or load a KingFisherProtocol, then call run_protocol(protocol) to run the full
-    protocol, or run_protocol(protocol, step_name=\"Mix1\") to run from a specific step.
-    For single-tip protocols, when step_name is set and tip_name is None, tip_name defaults
-    to protocol.tips[0].name (protocol must have at least one tip).
-    Then loop: name, evt, ack = await next_event(); handle event (e.g. load/remove plate);
-    if ack: await ack(); stop when name is Ready, Aborted, or Error.
-    """
-    if step_name is not None and tip_name is None and len(protocol.tips) == 1:
-      tip_name = protocol.tips[0].name
-    if step_name is not None and tip_name is None and len(protocol.tips) == 0:
-      raise ValueError("Protocol has no tips; specify tip_name when running from a step.")
-    await self.upload_protocol(protocol.name, protocol.to_bdz())
-    await self.start_protocol(protocol.name, tip=tip_name, step=step_name)
 
   @need_setup_finished
   async def stop_protocol(self) -> None:
     """Stop ongoing protocol/step execution."""
     return await self.backend.stop_protocol()
 
+  def _print_step_started(self, evt: ET.Element) -> None:
+    """Print progress for StepStarted (Evt/Step@name, @tip, @plate)."""
+    step_el = evt.find("Step")
+    if step_el is None:
+      print("  StepStarted")
+      return
+    step_name = step_el.get("name", "?")
+    tip_name = step_el.get("tip", "")
+    plate_name = step_el.get("plate", "")
+    parts = [f"Step: {step_name}"]
+    if tip_name:
+      parts.append(f"tip={tip_name}")
+    if plate_name:
+      parts.append(f"plate={plate_name}")
+    print("  ", " | ".join(parts))
+
+  def _print_protocol_time_left(self, evt: ET.Element) -> None:
+    """Print progress for ProtocolTimeLeft (Evt/TimeLeft@value, TimeToPause@value)."""
+    time_left_el = evt.find("TimeLeft")
+    time_to_pause_el = evt.find("TimeToPause")
+    time_left = time_left_el.get("value", "?") if time_left_el is not None else "?"
+    time_to_pause = time_to_pause_el.get("value", "") if time_to_pause_el is not None else ""
+    msg = f"  Time left: {time_left}"
+    if time_to_pause:
+      msg += f" (to next pause: {time_to_pause})"
+    print(msg)
+
   @need_setup_finished
   async def next_event(
     self, *, attach: bool = False
   ) -> Tuple[str, Optional[ET.Element], Optional[Callable[..., Any]]]:
-    """Wait for the next event; returns (name, evt, ack). Single API for \"get next event\".
+    """Wait for the next user-facing or terminal event; returns (name, evt, ack).
 
-    Blocks until the instrument sends the next event (no polling). Returns (name, evt, ack)
-    where evt is the raw XML element. Call when ready for the next event; do other work
-    (robot moves, user prompts, other instruments) between calls. For LoadPlate, RemovePlate,
-    ChangePlate, Pause call await ack() when ready so the run continues. Stop when name is
-    Ready, Aborted, or Error. Raw event stream without interpretation: use events().
+    Consumes StepStarted and ProtocolTimeLeft internally: prints progress (step name/tip/plate,
+    time left) and keeps waiting until the instrument sends an event that either (a) requires
+    user interaction (LoadPlate, RemovePlate, ChangePlate, Pause) or (b) ends the run
+    (Ready, Aborted, Error). Returns that event so the caller can acknowledge if needed or
+    treat as complete. Raw event stream without this behavior: use events().
 
     When attach=True (e.g. attaching to an in-progress run after setup when Busy), if status
     is already Idle or In error, returns (\"Ready\", None, None) without reading from the queue.
@@ -164,16 +189,24 @@ class KingFisherPresto(Machine):
       status = status_dict.get("status") or "In error"
       if status in ("Idle", "In error"):
         return ("Ready", None, None)
-    evt = await self.backend.get_event()
-    name = evt.get("name")
-    if name in ("LoadPlate", "RemovePlate", "ChangePlate", "Pause"):
-      return (name, evt, self.acknowledge)
-    if name == "Error":
-      return (name, evt, self.error_acknowledge)
-    if name in ("Ready", "Aborted"):
-      return (name, evt, None)
-    # Informational (StepStarted, ProtocolTimeLeft, Temperature, ChangeMagnets): no ack
-    return (name, evt, None)
+    while True:
+      evt = await self.backend.get_event()
+      name = evt.get("name")
+      if name in ("LoadPlate", "RemovePlate", "ChangePlate", "Pause"):
+        return (name, evt, self.acknowledge)
+      if name == "Error":
+        return (name, evt, self.error_acknowledge)
+      if name in ("Ready", "Aborted"):
+        return (name, evt, None)
+      if name == "StepStarted":
+        self._print_step_started(evt)
+        continue
+      if name == "ProtocolTimeLeft":
+        self._print_protocol_time_left(evt)
+        continue
+      # Other informational (Temperature, ChangeMagnets, etc.): print and consume
+      print(f"  Event: {name}")
+      continue
 
   def events(self):
     """Async generator of raw events (ET.Element). Use for low-level control; for (name, evt, ack) use next_event()."""

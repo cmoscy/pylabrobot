@@ -3,7 +3,7 @@
 Tests _find_complete_message (XML message boundaries, nested Res/Evt) and
 XML command building (_cmd_xml) per the KingFisher Presto Interface Specification.
 Also tests protocol CRC-32 formula used for UploadProtocol (BDZ_FORMAT.md).
-Tests BDZ builder output structure and run_protocol (protocol-based run).
+Tests BDZ builder output structure and upload_protocol/start_protocol (protocol-based run).
 """
 
 import asyncio
@@ -14,16 +14,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from .bdz_builder import (
-  build_collect_beads_bdz,
-  build_dry_bdz,
-  build_mix_bdz,
-  build_pause_bdz,
-  build_release_beads_bdz,
-  read_bdz,
-)
+from .bdz_builder import read_bdz
 from .kingfisher_protocol import (
   KingFisherProtocol,
+  MixShake,
   Plate,
   PlateType,
   Tip,
@@ -217,7 +211,9 @@ class TestTurntableState:
   def test_rotate_position_1_location_loading_sends_nest_1_position_2(self):
     backend = KingFisherPrestoBackend()
     evt_ready = ET.fromstring('<Evt name="Ready"/>')
-    with patch.object(backend._conn, "send_command", new_callable=AsyncMock) as mock_send, patch.object(
+    with patch.object(
+      backend._conn, "send_without_response", new_callable=AsyncMock
+    ) as mock_send, patch.object(
       backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_ready]
     ):
       asyncio.run(backend.rotate(position=1, location="loading"))
@@ -229,7 +225,7 @@ class TestTurntableState:
   def test_rotate_position_1_location_processing_sends_nest_1_position_1(self):
     backend = KingFisherPrestoBackend()
     evt_ready = ET.fromstring('<Evt name="Ready"/>')
-    with patch.object(backend._conn, "send_command", new_callable=AsyncMock), patch.object(
+    with patch.object(backend._conn, "send_without_response", new_callable=AsyncMock), patch.object(
       backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_ready]
     ):
       asyncio.run(backend.rotate(position=1, location="processing"))
@@ -238,7 +234,7 @@ class TestTurntableState:
   def test_rotate_on_error_does_not_update_state_and_raises(self):
     backend = KingFisherPrestoBackend()
     evt_error = ET.fromstring('<Evt name="Error"><Error code="5">Turntable position error.</Error></Evt>')
-    with patch.object(backend._conn, "send_command", new_callable=AsyncMock), patch.object(
+    with patch.object(backend._conn, "send_without_response", new_callable=AsyncMock), patch.object(
       backend._conn, "get_event", new_callable=AsyncMock, side_effect=[evt_error]
     ), patch.object(backend, "error_acknowledge", new_callable=AsyncMock) as mock_ack:
       with pytest.raises(PrestoConnectionError) as exc_info:
@@ -282,11 +278,12 @@ class TestTurntableState:
     connect_res = ET.fromstring(
       '<Res name="Connect" ok="true"><Instrument>KF</Instrument><Version>1</Version><Serial>123</Serial></Res>'
     )
-    rotate_res = ET.fromstring('<Res name="Rotate" ok="true"/>')
     with patch.object(backend._conn, "setup", new_callable=AsyncMock), patch.object(
       backend._conn, "send_command", new_callable=AsyncMock
-    ) as mock_send, patch.object(backend._conn, "get_event", new_callable=AsyncMock, return_value=evt_ready):
-      mock_send.side_effect = [connect_res, rotate_res]
+    ) as mock_send, patch.object(
+      backend._conn, "send_without_response", new_callable=AsyncMock
+    ), patch.object(backend._conn, "get_event", new_callable=AsyncMock, return_value=evt_ready):
+      mock_send.return_value = connect_res
       asyncio.run(backend.setup(initialize_turntable=True))
     assert backend._position_at_processing == 1
     assert backend.get_turntable_state() == {1: "processing", 2: "loading"}
@@ -520,10 +517,16 @@ def _decompress_bdz_blocks(bdz: bytes) -> tuple[bytes, bytes]:
 
 
 class TestBdzBuilder:
-  """BDZ builder: output has correct magic, two gzip blocks, ExportedData contains step."""
+  """BDZ structure validated via protocol.to_bdz(); no direct build_*_bdz."""
 
-  def test_build_mix_bdz_structure(self):
-    bdz = build_mix_bdz("plr_Mix", "Wash1", 30.0, "Fast")
+  def test_bdz_from_minimal_mix_protocol_structure(self):
+    """Build minimal protocol with one Mix step; to_bdz() produces valid BDZ with Containers."""
+    p = KingFisherProtocol(name="plr_Mix")
+    tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+    p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p.add_plate(Plate.create("Wash1", PlateType.DWP_96))
+    p.add_mix("Step1", "Wash1", shakes=[MixShake(duration_sec=30.0, speed="Fast")], loop_count=3)
+    bdz = p.to_bdz()
     assert bdz[:4] == bytes.fromhex("b6751cf2")
     assert bdz[18:33] == b"BindIt Software"
     props, exported = _decompress_bdz_blocks(bdz)
@@ -534,52 +537,51 @@ class TestBdzBuilder:
     assert b"<Mix " in exported
     assert b"Wash1" in exported
     assert b"PT30S" in exported
+    root = ET.fromstring(exported.decode("utf-8"))
+    containers = root.find(".//Containers")
+    assert containers is not None
+    container_els = list(containers.findall("Container"))
+    assert len(container_els) >= 1
+    for c in container_els:
+      assert c.get("groupId"), f"Container missing groupId: {ET.tostring(c)}"
+      contents = c.find("Contents")
+      assert contents is not None
+      reagent = contents.find("Reagent")
+      assert reagent is not None
 
-  def test_build_dry_bdz_structure(self):
-    bdz = build_dry_bdz("plr_Dry", 300.0, plate_name="Plate1")
+  def test_bdz_from_minimal_dry_protocol_structure(self):
+    """Build minimal protocol with one Dry step; to_bdz() produces valid BDZ with Containers."""
+    p = KingFisherProtocol(name="plr_Dry")
+    tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+    p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p.add_plate(Plate.create("Plate1", PlateType.DWP_96))
+    p.add_dry("Dry1", 300.0, TipPosition.AboveSurface)
+    bdz = p.to_bdz()
     assert bdz[:4] == bytes.fromhex("b6751cf2")
     props, exported = _decompress_bdz_blocks(bdz)
     assert b"<Dry " in exported
     assert b"Plate1" in exported
     assert b"PT5M" in exported or b"Duration" in exported
+    root = ET.fromstring(exported.decode("utf-8"))
+    containers = root.find(".//Containers")
+    assert containers is not None
+    container_els = list(containers.findall("Container"))
+    assert len(container_els) >= 1
+    for c in container_els:
+      assert c.get("groupId")
+      assert c.find("Contents/Reagent") is not None
 
-  def test_build_collect_beads_bdz_structure(self):
-    bdz = build_collect_beads_bdz("plr_CollectBeads", 3, 30.0, plate_name="P1")
-    assert bdz[:4] == bytes.fromhex("b6751cf2")
-    props, exported = _decompress_bdz_blocks(bdz)
-    assert b"CollectBeads" in exported
-    assert b"P1" in exported
-    assert b"<Count>3</Count>" in exported
-
-  def test_build_release_beads_bdz_structure(self):
-    bdz = build_release_beads_bdz("plr_ReleaseBeads", 10.0, "Fast", plate_name="P1")
-    assert bdz[:4] == bytes.fromhex("b6751cf2")
-    props, exported = _decompress_bdz_blocks(bdz)
-    assert b"ReleaseBeads" in exported
-    assert b"P1" in exported
-
-  def test_build_pause_bdz_structure(self):
-    bdz = build_pause_bdz("plr_Pause", "Wait for user")
-    assert bdz[:4] == bytes.fromhex("b6751cf2")
-    props, exported = _decompress_bdz_blocks(bdz)
-    assert b"<Pause " in exported
-    assert b"Wait for user" in exported
-
-  def test_mix_unsupported_speed_raises(self):
-    with pytest.raises(ValueError, match="Slow.*not supported"):
-      build_mix_bdz("plr_Mix", "Wash1", 30.0, "Slow")
-    with pytest.raises(ValueError, match="Bottom mix.*not supported"):
-      build_mix_bdz("plr_Mix", "Wash1", 30.0, "Bottom mix")
-
-  def test_collect_beads_count_out_of_range_raises(self):
-    with pytest.raises(ValueError, match="1..5"):
-      build_collect_beads_bdz("plr_CollectBeads", 0, 30.0)
-    with pytest.raises(ValueError, match="1..5"):
-      build_collect_beads_bdz("plr_CollectBeads", 6, 30.0)
-
-  def test_deterministic_same_inputs_same_bdz(self):
-    b1 = build_mix_bdz("plr_Mix", "Wash1", 30.0, "Medium")
-    b2 = build_mix_bdz("plr_Mix", "Wash1", 30.0, "Medium")
+  def test_deterministic_same_protocol_same_bdz(self):
+    """Same minimal protocol built twice yields identical BDZ bytes."""
+    def make_protocol():
+      p = KingFisherProtocol(name="plr_Mix")
+      tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+      p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+      p.add_plate(Plate.create("Wash1", PlateType.DWP_96))
+      p.add_mix("Step1", "Wash1", shakes=[MixShake(duration_sec=30.0, speed="Medium")], loop_count=3)
+      return p
+    b1 = make_protocol().to_bdz()
+    b2 = make_protocol().to_bdz()
     assert b1 == b2
 
 
@@ -628,6 +630,17 @@ class TestKingFisherProtocol:
     assert b"Pause1" in exported
     assert b"Mix2" in exported
     assert b"ReleaseBeads2" in exported
+    root = ET.fromstring(exported.decode("utf-8"))
+    containers = root.find(".//Containers")
+    assert containers is not None
+    container_els = list(containers.findall("Container"))
+    assert len(container_els) >= 1
+    for c in container_els:
+      assert c.get("groupId"), f"Container missing groupId: {ET.tostring(c)}"
+      contents = c.find("Contents")
+      assert contents is not None
+      reagent = contents.find("Reagent")
+      assert reagent is not None
     assert len(p.plates) == 4
     assert len(p.tips) == 1
     assert len(p.tips[0].steps) == 7
@@ -655,12 +668,39 @@ class TestKingFisherProtocol:
     step_names = [s.name for s in p.tips[0].steps]
     assert step_names == [s.name for s in p2.tips[0].steps]
 
+  def test_mix_unsupported_speed_raises(self):
+    """to_bdz() raises when protocol has Mix step with unsupported speed."""
+    p = KingFisherProtocol(name="plr_Mix")
+    tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+    p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p.add_plate(Plate.create("Wash1", PlateType.DWP_96))
+    p.add_mix("Step1", "Wash1", shakes=[MixShake(duration_sec=30.0, speed="Slow")], loop_count=3)
+    with pytest.raises(ValueError, match="Slow.*not supported"):
+      p.to_bdz()
+    p2 = KingFisherProtocol(name="plr_Mix2")
+    p2.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p2.add_plate(Plate.create("Wash1", PlateType.DWP_96))
+    p2.add_mix("Step1", "Wash1", shakes=[MixShake(duration_sec=30.0, speed="Bottom mix")], loop_count=3)
+    with pytest.raises(ValueError, match="Bottom mix.*not supported"):
+      p2.to_bdz()
+
+  def test_collect_beads_count_out_of_range_raises(self):
+    """add_collect_beads with count outside 1..5 raises."""
+    p = KingFisherProtocol(name="plr_CollectBeads")
+    tips_plate = Plate.create("Tips", PlateType.TIPS_96)
+    p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
+    p.add_plate(Plate.create("P1", PlateType.DWP_96))
+    with pytest.raises(ValueError, match="1..5"):
+      p.add_collect_beads("CollectBeads1", "P1", 0, 30.0)
+    with pytest.raises(ValueError, match="1..5"):
+      p.add_collect_beads("CollectBeads1", "P1", 6, 30.0)
+
 
 class TestPrestoHighLevelApi:
-  """run_protocol uploads and starts with correct args; delegation to backend."""
+  """upload_protocol(protocol), start_protocol(name, tip, step), delegation to backend."""
 
   def _minimal_protocol(self) -> KingFisherProtocol:
-    """One tip, one Mix step (for run_protocol tests)."""
+    """One tip, one Mix step."""
     p = KingFisherProtocol(name="TestRun")
     tips_plate = Plate.create("Tips", PlateType.TIPS_96)
     p.add_tip(Tip(name="Tip1", plate=tips_plate, steps=[]))
@@ -668,36 +708,45 @@ class TestPrestoHighLevelApi:
     p.add_mix("Mix1", "96 DWP", image=Image.Heating, loop_count=3)
     return p
 
-  def test_run_protocol_upload_and_start_with_protocol_name(self):
+  def test_upload_protocol_calls_backend_with_name_and_bdz(self):
+    """upload_protocol(protocol) calls backend with protocol.name and protocol.to_bdz()."""
     mock_backend = MagicMock()
     mock_backend.upload_protocol = AsyncMock(return_value=None)
-    mock_backend.start_protocol = AsyncMock(return_value=None)
     mock_backend._setup_finished = True
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
     protocol = self._minimal_protocol()
-    asyncio.run(presto.run_protocol(protocol))
+    asyncio.run(presto.upload_protocol(protocol))
     mock_backend.upload_protocol.assert_called_once()
     call_args = mock_backend.upload_protocol.call_args
     assert call_args[0][0] == protocol.name
     assert call_args[0][1] == protocol.to_bdz()
-    mock_backend.start_protocol.assert_called_once_with(protocol.name, tip=None, step=None)
 
-  def test_run_protocol_with_step_name_defaults_tip_for_single_tip(self):
+  def test_upload_protocol_bytes_delegates_to_backend(self):
+    """upload_protocol_bytes(name, bytes) delegates to backend.upload_protocol."""
     mock_backend = MagicMock()
     mock_backend.upload_protocol = AsyncMock(return_value=None)
+    mock_backend._setup_finished = True
+    presto = KingFisherPresto(backend=mock_backend)
+    presto._setup_finished = True
+    asyncio.run(presto.upload_protocol_bytes("MyProtocol", b"raw_bdz"))
+    mock_backend.upload_protocol.assert_called_once_with("MyProtocol", b"raw_bdz", crc=None)
+
+  def test_start_protocol_delegates_with_tip_and_step(self):
+    """start_protocol(name, tip, step) delegates to backend."""
+    mock_backend = MagicMock()
     mock_backend.start_protocol = AsyncMock(return_value=None)
     mock_backend._setup_finished = True
     presto = KingFisherPresto(backend=mock_backend)
     presto._setup_finished = True
     protocol = self._minimal_protocol()
-    asyncio.run(presto.run_protocol(protocol, step_name="Mix1"))
+    asyncio.run(presto.start_protocol(protocol.name, tip=protocol.tips[0].name, step="Mix1"))
     mock_backend.start_protocol.assert_called_once_with(
       protocol.name, tip=protocol.tips[0].name, step="Mix1"
     )
 
-  def test_run_protocol_then_next_event_loop_drains_events(self):
-    """Canonical flow: run_protocol() then loop next_event() until Ready; events are received."""
+  def test_upload_protocol_start_protocol_then_next_event_loop_drains_events(self):
+    """Canonical flow: upload_protocol(protocol), start_protocol(name), then loop next_event() until Ready."""
     mock_backend = MagicMock()
     mock_backend.upload_protocol = AsyncMock(return_value=None)
     mock_backend.start_protocol = AsyncMock(return_value=None)
@@ -708,8 +757,9 @@ class TestPrestoHighLevelApi:
     presto._setup_finished = True
     protocol = self._minimal_protocol()
 
-    async def run_then_drain():
-      await presto.run_protocol(protocol)
+    async def upload_start_then_drain():
+      await presto.upload_protocol(protocol)
+      await presto.start_protocol(protocol.name)
       items = []
       while True:
         name, evt, ack = await presto.next_event()
@@ -718,7 +768,7 @@ class TestPrestoHighLevelApi:
           break
       return items
 
-    items = asyncio.run(run_then_drain())
+    items = asyncio.run(upload_start_then_drain())
     assert len(items) == 1
     assert items[0][0] == "Ready"
     assert items[0][2] is None  # Ready has no ack callback
