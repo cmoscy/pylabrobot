@@ -3,8 +3,6 @@
 Same lifecycle as other machines (setup(), stop(), async with).
 Exposes start_protocol(), get_status(), acknowledge(), error_acknowledge(),
 next_event() for the next (name, evt, ack), and events() for a raw event stream.
-Main way to run: build or load a KingFisherProtocol, call upload_protocol(protocol)
-to upload it (conversion to .bdz happens inside), then start_protocol(protocol.name, tip=..., step=...).
 Drive the run with next_event() in a loop; handle each event, await ack() when required; stop when Ready/Aborted/Error.
 """
 
@@ -13,9 +11,7 @@ import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pylabrobot.machines.machine import Machine, need_setup_finished
-
-from .kingfisher_protocol import KingFisherProtocol
-from .presto_backend import KingFisherPrestoBackend, TurntableLocation
+from pylabrobot.particle_processing.kingfisher.presto_backend import KingFisherPrestoBackend, TurntableLocation
 
 
 class KingFisherPresto(Machine):
@@ -103,29 +99,6 @@ class KingFisherPresto(Machine):
   async def list_protocols(self) -> Tuple[List[str], int]:
     """List protocols in instrument memory. Returns (protocol_names, memory_used_percent)."""
     return await self.backend.list_protocols()
-
-  @need_setup_finished
-  async def download_protocol(self, name: str, *, raw_response: bool = False) -> bytes:
-    """Download a protocol from instrument memory. Returns raw protocol bytes.
-    When raw_response is True, returns bytes exactly as received (for debugging).
-    """
-    return await self.backend.download_protocol(name, raw_response=raw_response)
-
-  @need_setup_finished
-  async def upload_protocol(self, protocol: KingFisherProtocol) -> None:
-    """Upload a protocol to instrument memory. Conversion to .bdz is done here (protocol.to_bdz()).
-
-    Overwrites any existing protocol in instrument memory with the same name. For raw bytes
-    use upload_protocol_bytes(name, protocol_bytes, crc=None).
-    """
-    await self.backend.upload_protocol(protocol.name, protocol.to_bdz())
-
-  @need_setup_finished
-  async def upload_protocol_bytes(
-    self, name: str, protocol_bytes: bytes, crc: Optional[int] = None
-  ) -> None:
-    """Upload raw protocol bytes to instrument memory. crc optional (default: computed from bytes)."""
-    return await self.backend.upload_protocol(name, protocol_bytes, crc=crc)
 
   @need_setup_finished
   async def start_protocol(

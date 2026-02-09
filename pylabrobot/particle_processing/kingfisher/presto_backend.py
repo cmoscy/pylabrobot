@@ -15,13 +15,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pylabrobot.machines.backend import MachineBackend
 
-from .bdz_builder import BDZ_HEADER_LEN, BdzHeader
-from .error_codes import format_error_message, get_error_code_description
-from .presto_connection import (
+from pylabrobot.particle_processing.kingfisher.presto_connection import (
   KINGFISHER_PID,
   KINGFISHER_VID,
   PrestoConnection,
   PrestoConnectionError,
+  format_error_message,
+  get_error_code_description,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,44 +205,6 @@ class KingFisherPrestoBackend(MachineBackend):
     mem_el = res.find("MemoryUsed")
     memory_used = int(mem_el.get("value", 0)) if mem_el is not None else 0
     return (names, memory_used)
-
-  async def download_protocol(self, name: str, *, raw_response: bool = False) -> bytes:
-    """Download a protocol from instrument memory. Returns raw BDZ bytes.
-
-    Per Interface Spec §5.5: response is base64-encoded protocol file in CDATA.
-    Instrument response layout (observed): either (a) 24-byte prefix then gzip1,
-    spacer, gzip2, or (b) 61-byte BDZ header, 4 extra bytes, then gzip1, spacer, gzip2.
-    We normalize to a valid .bdz (61-byte header, gzip1, spacer, gzip2) for
-    read_bdz/parse_bdz_to_protocol. When raw_response is True, returns the decoded
-    bytes exactly as received (for debugging).
-    """
-    _GZIP_MAGIC = b"\x1f\x8b"
-    res = await self._conn.send_command(_cmd_xml("DownloadProtocol", protocol=name))
-    cdata = "".join(res.itertext()).replace(" ", "").replace("\n", "").replace("\r", "")
-    raw = base64.b64decode(cdata)
-    if raw_response:
-      return raw
-    # (a) Gzip at offset 24: instrument sent 24-byte prefix; prepend missing 37 bytes for full 61-byte header.
-    if len(raw) > BDZ_HEADER_LEN and raw[24:26] == _GZIP_MAGIC:
-      default_header = BdzHeader.default().to_bytes()
-      raw = raw[:24] + default_header[24:BDZ_HEADER_LEN] + raw[24:]
-    # (b) Gzip at offset 65: 61-byte header + 4 extra bytes; strip the 4 bytes.
-    elif len(raw) > BDZ_HEADER_LEN + 4 and raw[65:67] == _GZIP_MAGIC:
-      raw = raw[:BDZ_HEADER_LEN] + raw[BDZ_HEADER_LEN + 4:]
-    return raw
-
-  async def upload_protocol(self, name: str, protocol_bytes: bytes, crc: Optional[int] = None) -> None:
-    """Upload a protocol to instrument memory. crc: uint32 of BindIt protocol file data."""
-    if crc is None:
-      crc = binascii.crc32(protocol_bytes) & 0xFFFFFFFF
-    b64 = base64.b64encode(protocol_bytes).decode("ascii")
-    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
-    cdata_body = "\n        ".join(lines)
-    cmd = (
-      f'<Cmd name="UploadProtocol" protocol="{name}" crc="{crc}">\n'
-      f"    <![CDATA[\n        {cdata_body}\n    ]]>\n</Cmd>\n"
-    )
-    await self._conn.send_command(cmd)
 
   async def get_event(self) -> ET.Element:
     """Return the next raw event from the queue. Blocks until one is available.

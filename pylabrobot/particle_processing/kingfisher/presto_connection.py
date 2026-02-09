@@ -1,8 +1,9 @@
 """
 KingFisher Presto connection layer: HID transport, XML framing, message loop, event queue.
 
-Uses KingFisherHID (subclass of pylabrobot.io.hid.HID) which adds send_feature_report
-for Abort/flow control only in this package; the generic io.hid API is unchanged.
+Includes:
+- Error/warning codes from Interface Specification 4.8, 4.9 (for PrestoConnectionError and get_status).
+- KingFisherHID: subclass of pylabrobot.io.hid.HID adding send_feature_report for Abort/flow control.
 
 Protocol: 64-byte Output report (byte 0 = payload length, bytes 1–63 = payload);
 command termination newline (ASCII 10); messages <Cmd>, <Res>, <Evt>; demux Res to
@@ -14,10 +15,124 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import Callable, Optional, Tuple
 
-from .error_codes import format_error_message
-from .presto_hid import KingFisherHID
+from pylabrobot.io.hid import HID
 
 logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Error and warning codes (Interface Specification 4.8, 4.9)
+# -----------------------------------------------------------------------------
+
+ERROR_CODES: dict[int, str] = {
+  2: "Received an unknown command.",
+  3: "Already connected to another port.",
+  4: "Head position error.",
+  5: "Magnets position error.",
+  6: "Turntable position error.",
+  7: "Heater unit position error.",
+  8: "Lock position error.",
+  11: "Invalid command argument.",
+  13: "Protocol memory error.",
+  14: "Protocol memory is full.",
+  15: "No protocols found from the protocols memory.",
+  16: "Protocol was not found from the protocols memory.",
+  17: "Given tip name was not found from the protocol.",
+  18: "Given step name was not found from the given tip of the protocol.",
+  19: "A name of a step to start was not given.",
+  20: "A name of a tip where to start the step was not given.",
+  23: "Protocol name is invalid. Maximum length of the name is 100 bytes e.g. 100 ASCII characters.",
+  24: "Invalid protocol file.",
+  25: "Protocol is not executable.",
+  27: "Protocol is too large and can't be loaded.",
+  28: "Instrument is executing, please wait.",
+  32: "No protocol is currently running.",
+  33: "Data transmit to USB port failed (timed out).",
+  34: "Cannot run magnets down without tips.",
+  35: "Magnetic head is missing.",
+  38: "Plate not detected in processing position.",
+  124: "Protocol already running.",
+  321: "Execution failed.",
+}
+
+WARNING_CODES: dict[int, str] = {
+  101: "Instrument is already connected.",
+}
+
+
+def get_error_code_description(code: int) -> Optional[str]:
+  """Return the standard error description for a code, or None if unknown."""
+  return ERROR_CODES.get(code)
+
+
+def get_warning_code_description(code: int) -> Optional[str]:
+  """Return the standard warning description for a code, or None if unknown."""
+  return WARNING_CODES.get(code)
+
+
+def format_error_message(
+  code: Optional[int],
+  instrument_text: Optional[str],
+  *,
+  kind: str = "error",
+) -> str:
+  """Build an informative message from code and/or instrument text.
+
+  Prefers instrument text when present; appends standard description when we have a known code.
+  kind is \"error\" or \"warning\" (only error codes are in our table for now; warnings use same logic).
+  """
+  if instrument_text and instrument_text.strip():
+    text = instrument_text.strip()
+  else:
+    text = None
+  desc = get_error_code_description(code) if code is not None else None
+  if kind == "warning" and code is not None:
+    desc = get_warning_code_description(code) or desc
+  if desc and text and desc != text:
+    return f"{desc} ({text})"
+  if desc:
+    return desc
+  if text:
+    return text
+  if code is not None:
+    return f"Unknown {'warning' if kind == 'warning' else 'error'} code {code}."
+  return "Command failed"
+
+
+# -----------------------------------------------------------------------------
+# HID transport (Feature report for Abort/flow control; spec 3.2.3, 3.2.4)
+# -----------------------------------------------------------------------------
+
+
+class KingFisherHID(HID):
+  """HID transport for KingFisher Presto: adds send_feature_report for Abort/flow control."""
+
+  async def send_feature_report(self, data: bytes) -> int:
+    """Send a Feature report via the control endpoint.
+
+    KingFisher Presto uses this for Abort (first byte nonzero, second zero)
+    and optional flow control (first byte 0, second nonzero to pause; both 0 to resume).
+    See Interface Specification 3.2.3, 3.2.4.
+
+    Args:
+      data: Full report data (e.g. 2 bytes for KingFisher). Report ID is not prepended.
+
+    Returns:
+      Number of bytes written.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _send():
+      assert self.device is not None, "Call setup() first."
+      return self.device.send_feature_report(list(data))
+
+    if self._executor is None:
+      raise RuntimeError("Call setup() first.")
+    return await loop.run_in_executor(self._executor, _send)
+
+
+# -----------------------------------------------------------------------------
+# Connection: framing, message loop, event queue
+# -----------------------------------------------------------------------------
 
 REPORT_SIZE = 64
 PAYLOAD_MAX = 63
