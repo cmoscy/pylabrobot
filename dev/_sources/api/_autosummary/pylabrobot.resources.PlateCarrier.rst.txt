@@ -16,6 +16,7 @@ pylabrobot.resources.PlateCarrier
       :toctree: .
    
       ~PlateCarrier.capacity
+      ~PlateCarrier.location
       ~PlateCarrier.name
    
    
@@ -60,6 +61,7 @@ pylabrobot.resources.PlateCarrier
       ~PlateCarrier.get_size_x
       ~PlateCarrier.get_size_y
       ~PlateCarrier.get_size_z
+      ~PlateCarrier.has_resource
       ~PlateCarrier.is_in_subtree_of
       ~PlateCarrier.load_all_state
       ~PlateCarrier.load_from_json_file
@@ -72,6 +74,7 @@ pylabrobot.resources.PlateCarrier
       ~PlateCarrier.register_will_assign_resource_callback
       ~PlateCarrier.register_will_unassign_resource_callback
       ~PlateCarrier.rotate
+      ~PlateCarrier.rotate_to
       ~PlateCarrier.rotated
       ~PlateCarrier.save
       ~PlateCarrier.save_state_to_file

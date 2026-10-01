@@ -15,6 +15,7 @@ pylabrobot.resources.Resource
    .. autosummary::
       :toctree: .
    
+      ~Resource.location
       ~Resource.name
    
    
@@ -56,6 +57,7 @@ pylabrobot.resources.Resource
       ~Resource.get_size_x
       ~Resource.get_size_y
       ~Resource.get_size_z
+      ~Resource.has_resource
       ~Resource.is_in_subtree_of
       ~Resource.load_all_state
       ~Resource.load_from_json_file
@@ -68,6 +70,7 @@ pylabrobot.resources.Resource
       ~Resource.register_will_assign_resource_callback
       ~Resource.register_will_unassign_resource_callback
       ~Resource.rotate
+      ~Resource.rotate_to
       ~Resource.rotated
       ~Resource.save
       ~Resource.save_state_to_file

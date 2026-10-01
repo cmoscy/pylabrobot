@@ -15,6 +15,7 @@ pylabrobot.inheco.thermoshake.InhecoThermoShake
    .. autosummary::
       :toctree: .
    
+      ~InhecoThermoShake.location
       ~InhecoThermoShake.name
       ~InhecoThermoShake.resource
       ~InhecoThermoShake.supports_active_cooling
@@ -59,6 +60,7 @@ pylabrobot.inheco.thermoshake.InhecoThermoShake
       ~InhecoThermoShake.get_size_x
       ~InhecoThermoShake.get_size_y
       ~InhecoThermoShake.get_size_z
+      ~InhecoThermoShake.has_resource
       ~InhecoThermoShake.is_in_subtree_of
       ~InhecoThermoShake.load_all_state
       ~InhecoThermoShake.load_from_json_file
@@ -73,6 +75,7 @@ pylabrobot.inheco.thermoshake.InhecoThermoShake
       ~InhecoThermoShake.request_current_temperature
       ~InhecoThermoShake.request_device_info
       ~InhecoThermoShake.rotate
+      ~InhecoThermoShake.rotate_to
       ~InhecoThermoShake.rotated
       ~InhecoThermoShake.save
       ~InhecoThermoShake.save_state_to_file

@@ -18,6 +18,7 @@ pylabrobot.resources.TubeRack
       ~TubeRack.item_dx
       ~TubeRack.item_dy
       ~TubeRack.items
+      ~TubeRack.location
       ~TubeRack.name
       ~TubeRack.num_items
       ~TubeRack.num_items_x
@@ -77,6 +78,7 @@ pylabrobot.resources.TubeRack
       ~TubeRack.get_size_z
       ~TubeRack.get_tube
       ~TubeRack.has_container
+      ~TubeRack.has_resource
       ~TubeRack.index_of_item
       ~TubeRack.is_in_subtree_of
       ~TubeRack.load_all_state
@@ -90,6 +92,7 @@ pylabrobot.resources.TubeRack
       ~TubeRack.register_will_assign_resource_callback
       ~TubeRack.register_will_unassign_resource_callback
       ~TubeRack.rotate
+      ~TubeRack.rotate_to
       ~TubeRack.rotated
       ~TubeRack.row
       ~TubeRack.row_containers

@@ -15,6 +15,7 @@ pylabrobot.high\_res.sample\_storage.AmbiStore
    .. autosummary::
       :toctree: .
    
+      ~AmbiStore.location
       ~AmbiStore.model_info
       ~AmbiStore.motion_timeout
       ~AmbiStore.name
@@ -68,6 +69,7 @@ pylabrobot.high\_res.sample\_storage.AmbiStore
       ~AmbiStore.get_size_x
       ~AmbiStore.get_size_y
       ~AmbiStore.get_size_z
+      ~AmbiStore.has_resource
       ~AmbiStore.home
       ~AmbiStore.is_in_subtree_of
       ~AmbiStore.load_all_state
@@ -96,6 +98,7 @@ pylabrobot.high\_res.sample\_storage.AmbiStore
       ~AmbiStore.request_version
       ~AmbiStore.resolve_unresolved_transfer
       ~AmbiStore.rotate
+      ~AmbiStore.rotate_to
       ~AmbiStore.rotated
       ~AmbiStore.save
       ~AmbiStore.save_state_to_file

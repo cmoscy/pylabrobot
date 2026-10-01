@@ -16,6 +16,7 @@ pylabrobot.resources.Well
       :toctree: .
    
       ~Well.lid
+      ~Well.location
       ~Well.material_z_thickness
       ~Well.name
    
@@ -65,6 +66,7 @@ pylabrobot.resources.Well
       ~Well.get_size_y
       ~Well.get_size_z
       ~Well.has_lid
+      ~Well.has_resource
       ~Well.is_in_subtree_of
       ~Well.load_all_state
       ~Well.load_from_json_file
@@ -77,6 +79,7 @@ pylabrobot.resources.Well
       ~Well.register_will_assign_resource_callback
       ~Well.register_will_unassign_resource_callback
       ~Well.rotate
+      ~Well.rotate_to
       ~Well.rotated
       ~Well.save
       ~Well.save_state_to_file

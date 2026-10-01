@@ -16,6 +16,7 @@ pylabrobot.resources.PetriDish
       :toctree: .
    
       ~PetriDish.lid
+      ~PetriDish.location
       ~PetriDish.material_z_thickness
       ~PetriDish.name
    
@@ -62,6 +63,7 @@ pylabrobot.resources.PetriDish
       ~PetriDish.get_size_y
       ~PetriDish.get_size_z
       ~PetriDish.has_lid
+      ~PetriDish.has_resource
       ~PetriDish.is_in_subtree_of
       ~PetriDish.load_all_state
       ~PetriDish.load_from_json_file
@@ -74,6 +76,7 @@ pylabrobot.resources.PetriDish
       ~PetriDish.register_will_assign_resource_callback
       ~PetriDish.register_will_unassign_resource_callback
       ~PetriDish.rotate
+      ~PetriDish.rotate_to
       ~PetriDish.rotated
       ~PetriDish.save
       ~PetriDish.save_state_to_file

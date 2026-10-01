@@ -15,6 +15,7 @@ pylabrobot.resources.ResourceStack
    .. autosummary::
       :toctree: .
    
+      ~ResourceStack.location
       ~ResourceStack.name
    
    
@@ -59,6 +60,7 @@ pylabrobot.resources.ResourceStack
       ~ResourceStack.get_size_y
       ~ResourceStack.get_size_z
       ~ResourceStack.get_top_item
+      ~ResourceStack.has_resource
       ~ResourceStack.is_in_subtree_of
       ~ResourceStack.load_all_state
       ~ResourceStack.load_from_json_file
@@ -71,6 +73,7 @@ pylabrobot.resources.ResourceStack
       ~ResourceStack.register_will_assign_resource_callback
       ~ResourceStack.register_will_unassign_resource_callback
       ~ResourceStack.rotate
+      ~ResourceStack.rotate_to
       ~ResourceStack.rotated
       ~ResourceStack.save
       ~ResourceStack.save_state_to_file

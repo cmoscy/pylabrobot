@@ -15,6 +15,7 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbanceBaseUnit
    .. autosummary::
       :toctree: .
    
+      ~ByonoyAbsorbanceBaseUnit.location
       ~ByonoyAbsorbanceBaseUnit.name
    
    
@@ -56,6 +57,7 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbanceBaseUnit
       ~ByonoyAbsorbanceBaseUnit.get_size_x
       ~ByonoyAbsorbanceBaseUnit.get_size_y
       ~ByonoyAbsorbanceBaseUnit.get_size_z
+      ~ByonoyAbsorbanceBaseUnit.has_resource
       ~ByonoyAbsorbanceBaseUnit.is_in_subtree_of
       ~ByonoyAbsorbanceBaseUnit.load_all_state
       ~ByonoyAbsorbanceBaseUnit.load_from_json_file
@@ -68,6 +70,7 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbanceBaseUnit
       ~ByonoyAbsorbanceBaseUnit.register_will_assign_resource_callback
       ~ByonoyAbsorbanceBaseUnit.register_will_unassign_resource_callback
       ~ByonoyAbsorbanceBaseUnit.rotate
+      ~ByonoyAbsorbanceBaseUnit.rotate_to
       ~ByonoyAbsorbanceBaseUnit.rotated
       ~ByonoyAbsorbanceBaseUnit.save
       ~ByonoyAbsorbanceBaseUnit.save_state_to_file

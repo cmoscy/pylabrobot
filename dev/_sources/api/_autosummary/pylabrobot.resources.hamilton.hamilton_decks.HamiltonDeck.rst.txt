@@ -15,7 +15,10 @@ pylabrobot.resources.hamilton.hamilton\_decks.HamiltonDeck
    .. autosummary::
       :toctree: .
    
+      ~HamiltonDeck.location
       ~HamiltonDeck.name
+      ~HamiltonDeck.num_rails
+      ~HamiltonDeck.safe_deck_height
    
    
 
@@ -34,6 +37,7 @@ pylabrobot.resources.hamilton.hamilton\_decks.HamiltonDeck
       ~HamiltonDeck.centers
       ~HamiltonDeck.check_can_drop_resource_here
       ~HamiltonDeck.clear
+      ~HamiltonDeck.compute_right_track_of_carrier
       ~HamiltonDeck.copy
       ~HamiltonDeck.deregister_did_assign_resource_callback
       ~HamiltonDeck.deregister_did_unassign_resource_callback
@@ -51,8 +55,12 @@ pylabrobot.resources.hamilton.hamilton\_decks.HamiltonDeck
       ~HamiltonDeck.get_all_children
       ~HamiltonDeck.get_all_resources
       ~HamiltonDeck.get_anchor
+      ~HamiltonDeck.get_carrier_at_track
       ~HamiltonDeck.get_highest_known_point
       ~HamiltonDeck.get_location_wrt
+      ~HamiltonDeck.get_or_create_autoload_loading_tray
+      ~HamiltonDeck.get_or_create_autoload_sled
+      ~HamiltonDeck.get_or_create_x_arm
       ~HamiltonDeck.get_resource
       ~HamiltonDeck.get_root
       ~HamiltonDeck.get_size_x
@@ -74,6 +82,7 @@ pylabrobot.resources.hamilton.hamilton\_decks.HamiltonDeck
       ~HamiltonDeck.register_will_assign_resource_callback
       ~HamiltonDeck.register_will_unassign_resource_callback
       ~HamiltonDeck.rotate
+      ~HamiltonDeck.rotate_to
       ~HamiltonDeck.rotated
       ~HamiltonDeck.save
       ~HamiltonDeck.save_state_to_file
@@ -81,6 +90,7 @@ pylabrobot.resources.hamilton.hamilton\_decks.HamiltonDeck
       ~HamiltonDeck.serialize_all_state
       ~HamiltonDeck.serialize_state
       ~HamiltonDeck.summary
+      ~HamiltonDeck.track_to_location
       ~HamiltonDeck.unassign
       ~HamiltonDeck.unassign_child_resource
    

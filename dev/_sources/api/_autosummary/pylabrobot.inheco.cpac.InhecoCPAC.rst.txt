@@ -15,6 +15,7 @@ pylabrobot.inheco.cpac.InhecoCPAC
    .. autosummary::
       :toctree: .
    
+      ~InhecoCPAC.location
       ~InhecoCPAC.name
       ~InhecoCPAC.resource
       ~InhecoCPAC.supports_active_cooling
@@ -59,6 +60,7 @@ pylabrobot.inheco.cpac.InhecoCPAC
       ~InhecoCPAC.get_size_x
       ~InhecoCPAC.get_size_y
       ~InhecoCPAC.get_size_z
+      ~InhecoCPAC.has_resource
       ~InhecoCPAC.is_in_subtree_of
       ~InhecoCPAC.load_all_state
       ~InhecoCPAC.load_from_json_file
@@ -73,6 +75,7 @@ pylabrobot.inheco.cpac.InhecoCPAC
       ~InhecoCPAC.request_current_temperature
       ~InhecoCPAC.request_device_info
       ~InhecoCPAC.rotate
+      ~InhecoCPAC.rotate_to
       ~InhecoCPAC.rotated
       ~InhecoCPAC.save
       ~InhecoCPAC.save_state_to_file

@@ -16,6 +16,7 @@ pylabrobot.resources.TipCarrier
       :toctree: .
    
       ~TipCarrier.capacity
+      ~TipCarrier.location
       ~TipCarrier.name
    
    
@@ -60,6 +61,7 @@ pylabrobot.resources.TipCarrier
       ~TipCarrier.get_size_x
       ~TipCarrier.get_size_y
       ~TipCarrier.get_size_z
+      ~TipCarrier.has_resource
       ~TipCarrier.is_in_subtree_of
       ~TipCarrier.load_all_state
       ~TipCarrier.load_from_json_file
@@ -72,6 +74,7 @@ pylabrobot.resources.TipCarrier
       ~TipCarrier.register_will_assign_resource_callback
       ~TipCarrier.register_will_unassign_resource_callback
       ~TipCarrier.rotate
+      ~TipCarrier.rotate_to
       ~TipCarrier.rotated
       ~TipCarrier.save
       ~TipCarrier.save_state_to_file

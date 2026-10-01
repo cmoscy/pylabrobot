@@ -15,6 +15,7 @@ pylabrobot.inheco.scila.scila.SCILADrawerLoadingTray
    .. autosummary::
       :toctree: .
    
+      ~SCILADrawerLoadingTray.location
       ~SCILADrawerLoadingTray.name
       ~SCILADrawerLoadingTray.resource
    
@@ -59,6 +60,7 @@ pylabrobot.inheco.scila.scila.SCILADrawerLoadingTray
       ~SCILADrawerLoadingTray.get_size_x
       ~SCILADrawerLoadingTray.get_size_y
       ~SCILADrawerLoadingTray.get_size_z
+      ~SCILADrawerLoadingTray.has_resource
       ~SCILADrawerLoadingTray.is_in_subtree_of
       ~SCILADrawerLoadingTray.load_all_state
       ~SCILADrawerLoadingTray.load_from_json_file
@@ -72,6 +74,7 @@ pylabrobot.inheco.scila.scila.SCILADrawerLoadingTray
       ~SCILADrawerLoadingTray.register_will_assign_resource_callback
       ~SCILADrawerLoadingTray.register_will_unassign_resource_callback
       ~SCILADrawerLoadingTray.rotate
+      ~SCILADrawerLoadingTray.rotate_to
       ~SCILADrawerLoadingTray.rotated
       ~SCILADrawerLoadingTray.save
       ~SCILADrawerLoadingTray.save_state_to_file

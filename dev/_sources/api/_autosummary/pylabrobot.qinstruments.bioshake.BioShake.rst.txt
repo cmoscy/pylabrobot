@@ -15,6 +15,7 @@ pylabrobot.qinstruments.bioshake.BioShake
    .. autosummary::
       :toctree: .
    
+      ~BioShake.location
       ~BioShake.name
       ~BioShake.resource
    
@@ -59,6 +60,7 @@ pylabrobot.qinstruments.bioshake.BioShake
       ~BioShake.get_size_x
       ~BioShake.get_size_y
       ~BioShake.get_size_z
+      ~BioShake.has_resource
       ~BioShake.home
       ~BioShake.is_in_subtree_of
       ~BioShake.load_all_state
@@ -75,6 +77,7 @@ pylabrobot.qinstruments.bioshake.BioShake
       ~BioShake.request_current_temperature
       ~BioShake.reset
       ~BioShake.rotate
+      ~BioShake.rotate_to
       ~BioShake.rotated
       ~BioShake.save
       ~BioShake.save_state_to_file

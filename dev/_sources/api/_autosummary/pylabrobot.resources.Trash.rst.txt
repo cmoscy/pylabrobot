@@ -16,6 +16,7 @@ pylabrobot.resources.Trash
       :toctree: .
    
       ~Trash.lid
+      ~Trash.location
       ~Trash.material_z_thickness
       ~Trash.name
    
@@ -62,6 +63,7 @@ pylabrobot.resources.Trash
       ~Trash.get_size_y
       ~Trash.get_size_z
       ~Trash.has_lid
+      ~Trash.has_resource
       ~Trash.is_in_subtree_of
       ~Trash.load_all_state
       ~Trash.load_from_json_file
@@ -74,6 +76,7 @@ pylabrobot.resources.Trash
       ~Trash.register_will_assign_resource_callback
       ~Trash.register_will_unassign_resource_callback
       ~Trash.rotate
+      ~Trash.rotate_to
       ~Trash.rotated
       ~Trash.save
       ~Trash.save_state_to_file

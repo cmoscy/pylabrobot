@@ -15,6 +15,7 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbance96
    .. autosummary::
       :toctree: .
    
+      ~ByonoyAbsorbance96.location
       ~ByonoyAbsorbance96.name
    
    
@@ -58,6 +59,7 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbance96
       ~ByonoyAbsorbance96.get_size_x
       ~ByonoyAbsorbance96.get_size_y
       ~ByonoyAbsorbance96.get_size_z
+      ~ByonoyAbsorbance96.has_resource
       ~ByonoyAbsorbance96.initialize_measurements
       ~ByonoyAbsorbance96.is_in_subtree_of
       ~ByonoyAbsorbance96.load_all_state
@@ -75,10 +77,12 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbance96
       ~ByonoyAbsorbance96.request_available_absorbance_wavelengths
       ~ByonoyAbsorbance96.request_device_info
       ~ByonoyAbsorbance96.request_environment
+      ~ByonoyAbsorbance96.request_ignore_errors_in_calibration
       ~ByonoyAbsorbance96.request_status
       ~ByonoyAbsorbance96.request_supported_reports
       ~ByonoyAbsorbance96.request_versions
       ~ByonoyAbsorbance96.rotate
+      ~ByonoyAbsorbance96.rotate_to
       ~ByonoyAbsorbance96.rotated
       ~ByonoyAbsorbance96.save
       ~ByonoyAbsorbance96.save_state_to_file
@@ -86,6 +90,7 @@ pylabrobot.byonoy.absorbance\_96.ByonoyAbsorbance96
       ~ByonoyAbsorbance96.serialize
       ~ByonoyAbsorbance96.serialize_all_state
       ~ByonoyAbsorbance96.serialize_state
+      ~ByonoyAbsorbance96.set_ignore_errors_in_calibration
       ~ByonoyAbsorbance96.set_led_color
       ~ByonoyAbsorbance96.set_led_colors
       ~ByonoyAbsorbance96.setup
