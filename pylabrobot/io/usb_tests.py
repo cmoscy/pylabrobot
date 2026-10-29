@@ -102,3 +102,74 @@ class USBReadTests(unittest.IsolatedAsyncioTestCase):
     self.device.read.side_effect = [b"stale reply", OSError("timeout")]
     await self.io.drain(size=128)
     self.assertEqual([call.args[1] for call in self.device.read.call_args_list], [128, 128])
+
+
+class USBWriteTests(unittest.IsolatedAsyncioTestCase):
+  """End a packet-aligned write with a zero-length packet only when the device expects one."""
+
+  def _make_io(self, **kwargs) -> USB:
+    """A USB object attached to a mock device with a 32-byte write endpoint."""
+    backend = SimpleNamespace(
+      util=SimpleNamespace(find_descriptor=Mock()), core=SimpleNamespace(USBError=OSError)
+    )
+    patcher = patch.object(usb_module, "usb", backend, create=True)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    io = USB(1, 2, "mock USB", **kwargs)
+    io.dev = Mock()
+    io.read_endpoint = Mock(wMaxPacketSize=16, bEndpointAddress=0x81)
+    io.write_endpoint = Mock(wMaxPacketSize=32, bEndpointAddress=0x02)
+    io._read_executor = ThreadPoolExecutor(max_workers=1)
+    io._write_executor = ThreadPoolExecutor(max_workers=1)
+    self.addCleanup(io._shutdown_executors)
+    return io
+
+  async def test_packet_aligned_write_sends_zero_length_packet_by_default(self) -> None:
+    """A write that fills whole packets is followed by an empty one."""
+    io = self._make_io()
+    await io.write(b"a" * 32)
+    self.assertEqual([call.args[1] for call in io.dev.write.call_args_list], [b"a" * 32, b""])
+
+  async def test_packet_aligned_write_without_zero_length_packet(self) -> None:
+    """A device that delimits its own messages gets the data alone."""
+    io = self._make_io(send_zero_length_packet=False)
+    await io.write(b"a" * 32)
+    self.assertEqual([call.args[1] for call in io.dev.write.call_args_list], [b"a" * 32])
+
+  async def test_short_write_never_sends_zero_length_packet(self) -> None:
+    """A short packet already ends the transfer."""
+    io = self._make_io()
+    await io.write(b"a" * 7)
+    self.assertEqual([call.args[1] for call in io.dev.write.call_args_list], [b"a" * 7])
+
+  def test_serialize_records_only_a_disabled_zero_length_packet(self) -> None:
+    """The default is left out, so existing serialized devices are unchanged."""
+    self.assertNotIn("send_zero_length_packet", self._make_io().serialize())
+    self.assertFalse(
+      self._make_io(send_zero_length_packet=False).serialize()["send_zero_length_packet"]
+    )
+
+
+class USBDeviceSelectionTests(unittest.TestCase):
+  """Pick a device by serial number, reading the descriptor rather than PyUSB's empty cache."""
+
+  def _devices(self, *serials):
+    devices = []
+    for serial in serials:
+      dev = Mock(iSerialNumber=3 if serial else 0, _serial_number=None, serial_number=serial)
+      devices.append(dev)
+    return devices
+
+  def test_serial_number_is_read_through_the_descriptor(self) -> None:
+    devices = self._devices("A", "B")
+    with patch.object(usb_module, "libusb_package", create=True) as lib:
+      lib.find.return_value = devices
+      self.assertEqual(
+        USB(1, 2, "mock USB", serial_number="B").get_available_devices(), [devices[1]]
+      )
+
+  def test_device_without_serial_number_is_refused(self) -> None:
+    with patch.object(usb_module, "libusb_package", create=True) as lib:
+      lib.find.return_value = self._devices(None)
+      with self.assertRaisesRegex(RuntimeError, "does not have a serial number"):
+        USB(1, 2, "mock USB", serial_number="B").get_available_devices()

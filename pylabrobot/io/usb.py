@@ -59,6 +59,7 @@ class USB(IOBase):
     max_workers: int = 1,
     read_endpoint_address: Optional[int] = None,
     write_endpoint_address: Optional[int] = None,
+    send_zero_length_packet: bool = True,
   ):
     """Initialize an io.USB object.
 
@@ -77,6 +78,9 @@ class USB(IOBase):
       configuration_callback: A callback that takes the device object as an argument and performs
         any necessary configuration. If `None`, `dev.set_configuration()` is called.
       max_workers: The maximum number of worker threads for USB I/O operations.
+      send_zero_length_packet: Whether to end a write whose length is a multiple of the write
+        endpoint's packet size with a zero-length packet. Devices that delimit their messages
+        themselves, such as with a length byte, may not expect one.
     """
 
     super().__init__()
@@ -100,6 +104,7 @@ class USB(IOBase):
     self.write_endpoint_address = write_endpoint_address
     self.configuration_callback = configuration_callback
     self.max_workers = max_workers
+    self.send_zero_length_packet = send_zero_length_packet
 
     self.dev: Optional[usb.core.Device] = None  # TODO: make this a property
     self.read_endpoint: Optional[usb.core.Endpoint] = None
@@ -148,7 +153,7 @@ class USB(IOBase):
         write_endpoint, data, timeout=int(timeout * 1000)
       ),  # PyUSB expects timeout in milliseconds
     )
-    if len(data) % write_endpoint.wMaxPacketSize == 0:
+    if self.send_zero_length_packet and len(data) % write_endpoint.wMaxPacketSize == 0:
       # send a zero-length packet to indicate the end of the transfer
       await loop.run_in_executor(
         self._write_executor,
@@ -347,7 +352,9 @@ class USB(IOBase):
           continue
 
       if self._serial_number is not None:
-        if dev._serial_number is None:
+        # PyUSB reads the serial number descriptor on first access; `_serial_number` is only its
+        # cache, empty until then.
+        if dev.iSerialNumber == 0 or dev.serial_number is None:
           raise RuntimeError(
             f"A serial number was specified for '{self.human_readable_device_name}', but the device does not have a serial number."
           )
@@ -570,6 +577,8 @@ class USB(IOBase):
       d["read_endpoint_address"] = self.read_endpoint_address
     if self.write_endpoint_address is not None:
       d["write_endpoint_address"] = self.write_endpoint_address
+    if not self.send_zero_length_packet:
+      d["send_zero_length_packet"] = False
     return d
 
 
@@ -589,6 +598,7 @@ class USBValidator(USB):
     write_endpoint_address: Optional[int] = None,
     configuration_callback: Optional[Callable[["usb.core.Device"], None]] = None,
     max_workers: int = 1,
+    send_zero_length_packet: bool = True,
   ):
     super().__init__(
       human_readable_device_name=human_readable_device_name,
@@ -603,6 +613,7 @@ class USBValidator(USB):
       write_endpoint_address=write_endpoint_address,
       configuration_callback=configuration_callback,
       max_workers=max_workers,
+      send_zero_length_packet=send_zero_length_packet,
     )
     self.cr = cr
 
