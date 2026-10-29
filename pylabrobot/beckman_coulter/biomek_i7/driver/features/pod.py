@@ -1,0 +1,831 @@
+"""One pod: an arm on the shared X rail, its ACE module, and the axes that module drives."""
+
+import asyncio
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import (
+  TYPE_CHECKING,
+  Callable,
+  Dict,
+  Iterable,
+  List,
+  Literal,
+  Mapping,
+  Optional,
+  Sequence,
+  Tuple,
+)
+
+from pylabrobot.beckman_coulter.biomek_i7.driver import motion
+from pylabrobot.beckman_coulter.biomek_i7.driver import protocol as p
+from pylabrobot.beckman_coulter.biomek_i7.driver.board import AceBoard
+from pylabrobot.beckman_coulter.biomek_i7.driver.configuration import (
+  ModuleConfiguration,
+  PodConfiguration,
+)
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.module import (
+  read_analog_inputs,
+  read_module,
+)
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.homing import (
+  ENABLE_ORDER,
+  ENABLE_PREFIX,
+  HOME_RECIPES,
+  Homer,
+)
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.gripper import Gripper
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.head96 import Head96
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.pipettes import Pipettes
+from pylabrobot.beckman_coulter.biomek_i7.driver.errors import AceError, NotHomedError, english
+from pylabrobot.beckman_coulter.biomek_i7.driver.motors import Axis, AxisMove, MotorTables
+from pylabrobot.beckman_coulter.biomek_i7.driver import pod_geometry as g
+from pylabrobot.beckman_coulter.biomek_i7.driver.x_rail import PodPose, RailCollisionError, XRail
+
+if TYPE_CHECKING:
+  from pylabrobot.beckman_coulter.biomek_i7.driver.master import BiomekI7Driver
+
+logger = logging.getLogger(__name__)
+
+# How Biomek numbers its pods. Pod1 is the left pod and Pod2 the right on the instrument this
+# driver was written against; whether that holds on every build is not established.
+POD_NUMBERS = {"left": 1, "right": 2}
+COMPONENT_PREFIXES = {"multichannel": "MC", "span8": "SPAN8"}
+# The axes that change what a pod takes up along the X rail.
+RAIL_AXES = ("X", "GR", "GG")
+
+# Get Homed State answers. 0x01 was read from every axis at a cold start, 0x00 from every axis of
+# both pods after Biomek's Home All (H1, 2026-10-24).
+HOMED_STATES = {0x00: "homed", 0x01: "not_homed"}
+
+# The timeouts the Master Controller gives the boards: a single axis's move, and a Move All.
+MOVE_TIMEOUT_MS = 30000
+MOVE_ALL_TIMEOUT_MS = 5000
+
+# Biomek's "Safe Height" (`GlobalMinSafeHeight`) at or below this is unset (it stores -100000).
+UNSET_SAFE_HEIGHT = -1000.0
+
+# The arm board's analog input carrying the interlocked motor supply ("+36V Interlock").
+DRIVE_SUPPLY_INPUT = "+36V Interlock"
+
+# Set State ENABLED on a CiA 402 drive resets a fault, then steps the drive through shutdown, switch
+# on and enable operation, waiting up to 3 s for each. Whether a board enables
+# a batch one drive at a time is not known, so a batch is given that per axis; it is a bound for
+# a drive that does not come up, not how long enabling takes.
+ENABLE_SECONDS_PER_AXIS = 9.0
+
+
+@dataclass(frozen=True)
+class MoveResult:
+  """What a coordinated move did: the motions it sent (empty when every axis was already there),
+  and each axis's report that was not a plain finish. A sensor stop says where
+  (`MotionComplete.position`)."""
+
+  motions: List[motion.Motion] = field(default_factory=list)
+  completions: Dict[str, p.MotionComplete] = field(default_factory=dict)
+
+  def stopped_at(self, axis: str) -> Optional[int]:
+    """Where a sensor stopped `axis`, in counts; None if none did."""
+    complete = self.completions.get(axis)
+    return complete.position if complete is not None else None
+
+
+# How long this driver waits for a board to answer a Home, in seconds. The longest homing seen
+# took 9 s; the boards' own homing timeouts (Configure "Homing Timeout") are up to 60 s.
+HOME_REPLY_TIMEOUT = 65.0
+
+
+class Pod:
+  """One pod. Reached as `driver.left_pod` / `driver.right_pod`; plays the part of STAR's `XArm`.
+
+  Holds what every pod has: one board and its axes, moved together (`move_axes`, the Master
+  Controller's `AM`), the position record the Master Controller keeps, homing, and the pod's pose
+  on the shared X rail. `module_type` says what else the pod carries, as features: `multichannel`
+  a 96-channel head (`head96`), `span8` eight independent channels (`pipettes`); both a `gripper`.
+  """
+
+  def __init__(
+    self,
+    board: AceBoard,
+    side: Literal["left", "right"],
+    module_type: str,
+    motor_tables: MotorTables,
+    declared: Optional[PodConfiguration] = None,
+  ):
+    self.board = board
+    self.side = side
+    self.module_type = module_type
+    self.axes: List[Axis] = motor_tables.axes(module_type)
+    self.configuration: Optional[ModuleConfiguration] = None
+    # What the instrument's declared configuration says about this pod: its conversions, travel
+    # limits and geometry. None when nothing is declared for this side.
+    self.declared = declared
+    # The driver this pod belongs to, set at discovery: what the features reach the deck, the
+    # declared deck positions and the session state through. None for a pod used on its own.
+    self.driver: Optional["BiomekI7Driver"] = None
+    # The shared X rail, set by the driver once both pods are found. Every move that changes what
+    # the pod takes up along it (X, the gripper's GR or GG) goes through it.
+    self.rail: Optional[XRail] = None
+    # What the gripper holds, as the rail counts it: set through `gripper.set_held_labware`; the
+    # pod cannot sense it.
+    self._held_labware: Optional[g.HeldLabware] = None
+    # Where this driver last put each axis, as the Master Controller keeps it (`cpositions`):
+    # (position, adjusted); position None until read. Starts as after homing.
+    self._cpositions: Dict[str, motion.CPos] = {a.name: (None, a.home_position) for a in self.axes}
+    # The pumps' state, kept with the positions as the Master Controller keeps it in the Span-8's
+    # state record, because every pump move carries it; set through `pipettes`. Each syringe
+    # pump's valve as last set (None until then), and the cutoff velocity (`CV`), counts/s,
+    # clamped to each pump's range when used.
+    self._valves: Dict[str, Optional[p.Valve]] = {a.name: None for a in self.axes if a.is_pump}
+    self._cutoff_velocity = 0
+    # Set while the interlock is tripped, shared by the driver (`BiomekI7Driver.interlock_tripped`);
+    # None for a pod used without one. Waits that the Master Controller abandons on a trip watch it.
+    self.interlock_tripped: Optional[asyncio.Event] = None
+    # The height the channels rise to before traveling over the deck (`move_over`), Biomek's Z (cm
+    # of the channels' bottom above the deck): STAR's `default_minimum_traverse_height`. Seeded
+    # from Biomek's "Safe Height" (`GlobalMinSafeHeight`) when it is set; None, as on an instrument
+    # where it is not (-100000), means the top of travel less the park margin, which is what
+    # Biomek does with Safe Height set to the top.
+    self.default_minimum_traverse_height: Optional[float] = None
+    if declared is not None:
+      safe = declared.settings.get("GlobalMinSafeHeight")
+      if isinstance(safe, (int, float)) and safe > UNSET_SAFE_HEIGHT:
+        self.default_minimum_traverse_height = float(safe)
+    # Who follows the position record (`add_position_listener`).
+    self._listeners: List[Callable[["Pod"], None]] = []
+    # What the pod carries (STAR's arm features): a gripper on every pod, a 96-channel head on a
+    # Multichannel, eight channels on a Span-8.
+    self.gripper = Gripper(self)
+    self.head96: Optional[Head96] = Head96(self) if module_type == "multichannel" else None
+    self.pipettes: Optional[Pipettes] = Pipettes(self) if module_type == "span8" else None
+
+  @property
+  def pod_number(self) -> int:
+    return POD_NUMBERS[self.side]
+
+  def __str__(self) -> str:
+    return f"{self.side} pod (Pod{self.pod_number}, {self.module_type})"
+
+  @property
+  def component(self) -> str:
+    """The name Biomek gives this pod's component in its logs (`host_command.component`):
+    `MC_1`, `SPAN8_2`. The driver's own log lines for host commands use it too, so a session can
+    be lined up with one of Biomek's."""
+    return f"{COMPONENT_PREFIXES[self.module_type]}_{self.pod_number}"
+
+  def axis(self, name: str) -> Axis:
+    for axis in self.axes:
+      if axis.name == name:
+        return axis
+    raise ValueError(f"{self} has no axis {name!r}; it has {[a.name for a in self.axes]}")
+
+  async def discover(self) -> ModuleConfiguration:
+    """Read what the pod's module says about itself. Moves nothing."""
+    self.configuration = await read_module(self.board)
+    return self.configuration
+
+  async def request_positions(self) -> Dict[str, int]:
+    """Every axis's current position, in counts, as the drives report it."""
+    replies = await self.board.send_many(
+      [p.get_current_position(axis.device, axis.index) for axis in self.axes]
+    )
+    return {axis.name: p.parse_s32(r.payload) for axis, r in zip(self.axes, replies)}
+
+  async def request_axis_states(self) -> Dict[str, p.AxisState]:
+    """Every axis's state (motors and pumps), sent together. Moves nothing.
+
+    Raises:
+      ValueError: for a state byte the firmware does not set.
+    """
+    replies = await self.board.send_many([p.get_state(a.device, a.index) for a in self.axes])
+    return {a.name: p.parse_axis_state(r.payload) for a, r in zip(self.axes, replies)}
+
+  async def request_drive_supply(self) -> float:
+    """The pod's interlocked motor supply, in volts: about 36 with the interlock armed, about 0.1
+    tripped. Moves nothing.
+
+    Raises:
+      RuntimeError: if the pod has no input named for it.
+    """
+    if self.configuration is None:
+      raise RuntimeError(f"{self} has not been read; call `discover()` or `setup()` first")
+    for index, name in self.configuration.analog_inputs.items():
+      if name.startswith(DRIVE_SUPPLY_INPUT):
+        reply = await self.board.send(p.read_input_output(p.Device.ANALOG_INPUT, index))
+        return p.parse_float(reply.payload)
+    raise RuntimeError(f"{self} has no {DRIVE_SUPPLY_INPUT!r} analog input")
+
+  async def request_homed_state(self, axis_name: str) -> str:
+    """Whether a motor axis has been homed: `homed`, `not_homed`, or the raw code of a state not
+    yet seen."""
+    axis = self.axis(axis_name)
+    code = (await self.board.send(p.get_homed_state(axis.index))).payload[0]
+    return HOMED_STATES.get(code, f"0x{code:02X}")
+
+  async def request_accuframe_offsets(self) -> Tuple[float, float, float]:
+    """The X, Y and Z offsets the pod's AccuFrame board holds."""
+    return p.parse_accuframe_offsets((await self.board.send(p.get_accuframe_offsets())).payload)
+
+  async def read_analog_inputs(self) -> Dict[str, float]:
+    if self.configuration is None:
+      raise RuntimeError(f"{self} has not been read; call `discover()` or `setup()` first")
+    return await read_analog_inputs(self.board, self.configuration)
+
+  # -- configuration and homing ------------------------------------------------
+  # These write to the board and move the arm. Nothing in this driver calls them on its own.
+
+  async def configure(self) -> None:
+    """Load every axis's motor table into the board, then Stop Module Execution, as after a
+    power-up. The tables come from the motor recording; the board cannot be asked for them.
+
+    Configuring an axis that is configured is accepted, and leaves it disabled and not homed, so
+    this un-homes the pod."""
+    logger.info("%s configure (%d axes)", self.component, len(self.axes))
+    self._set_home_positions(a.name for a in self.axes)
+    for axis in self.axes:
+      await self._unchecked_fw_configure(axis)
+    await self._unchecked_fw_stop_module_execution()
+
+  async def enable_axes(self) -> Dict[str, int]:
+    """Stop motion and enable every axis, as after the interlock is armed (its drive power was
+    off), and read where each is, as the Master Controller resumes: the positions cleared, then
+    each axis enabled and read. Returns every axis's position."""
+    axes = [self.axis(name) for name in ENABLE_ORDER[self.module_type]]
+    self._forget_positions()
+    await self._unchecked_fw_enable(ENABLE_PREFIX[self.module_type])
+    await self._unchecked_fw_stop_motion()
+    await self._unchecked_fw_enable(ENABLE_ORDER[self.module_type])
+    replies = await self.board.send_many([p.get_current_position(a.device, a.index) for a in axes])
+    positions = {a.name: p.parse_s32(r.payload) for a, r in zip(axes, replies)}
+    # As the Master Controller does, each read is the axis's position.
+    for axis in axes:
+      self._cpositions[axis.name] = motion.update_cpos(
+        self._cpositions[axis.name], positions[axis.name], axis.hysteresis
+      )
+    self._positions_changed()
+    return positions
+
+  async def home(self, force: bool = False) -> None:
+    """Home every axis but the plunger (or syringe pumps), in the Master Controller's `HM` order.
+
+    Axes not homed are homed. Axes already homed are moved to where a Home would leave them, or,
+    with `force`, moved to their approach positions and homed again as `HM` does. Each ends where
+    Biomek leaves it."""
+    logger.info("%s HM%s", self.component, "" if force else " (homed axes kept)")
+    try:
+      await Homer(self, force=force).run(HOME_RECIPES[self.module_type])
+    finally:
+      self._set_home_positions(Homer.axes(HOME_RECIPES[self.module_type]))
+
+  # -- coordinated moves -------------------------------------------------------
+  # The Master Controller's `AM`, with its position bookkeeping: see `motion.py`.
+
+  @property
+  def cpositions(self) -> Dict[str, motion.CPos]:
+    """Each axis's (position, adjusted), as this driver keeps them; position None until read."""
+    return dict(self._cpositions)
+
+  def _set_home_positions(self, names: Iterable[str]) -> None:
+    """After homing: position unknown, adjusted at the axis's home."""
+    for name in names:
+      self._cpositions[name] = (None, self.axis(name).home_position)
+    self._positions_changed()
+
+  def _forget_positions(
+    self,
+    names: Optional[Iterable[str]] = None,
+    adjusted: Optional[Mapping[str, motion.CPos]] = None,
+  ) -> None:
+    """Mark positions unknown, so the next move reads them first; adjusted
+    positions stay, or are taken from `adjusted`."""
+    for name in list(self._cpositions) if names is None else names:
+      self._cpositions[name] = (None, (adjusted or self._cpositions)[name][1])
+    self._positions_changed()
+
+  async def _read_unknown_positions(self, pumps: bool = False) -> None:
+    """As the Master Controller does before every move: if any axis's position is
+    unknown, Stop Motion Service, then enable and read each such axis. Syringe pumps are included
+    only when the move uses them (`pumps`)."""
+    unknown = [
+      a for a in self.axes if (pumps or not a.is_pump) and self._cpositions[a.name][0] is None
+    ]
+    if not unknown:
+      return
+    await self._unchecked_fw_stop_motion()
+    await self._unchecked_fw_enable([a.name for a in unknown])
+    replies = await self.board.send_many(
+      [p.get_current_position(a.device, a.index) for a in unknown]
+    )
+    for axis, reply in zip(unknown, replies):
+      position = p.parse_s32(reply.payload)
+      self._cpositions[axis.name] = motion.update_cpos(
+        self._cpositions[axis.name], position, axis.hysteresis
+      )
+    self._positions_changed()
+
+  async def request_x_position(self) -> int:
+    """Where the pod's X is, in counts, as its drive reports it. Moves nothing."""
+    x = self.axis("X")
+    return p.parse_s32((await self.board.send(p.get_current_position(x.device, x.index))).payload)
+
+  # -- the shared X rail ---------------------------------------------------------
+
+  def _rail_pose(self, x: int, gr: Optional[int], gg: Optional[int]) -> PodPose:
+    """A pose in counts as the rail takes it: deck X, and the gripper in degrees and cm."""
+    d = self._require_declared()
+    gripper = None
+    if gr is not None and gg is not None:
+      gripper = g.GripperPose(d.to_value("GR", gr), d.to_value("GG", gg), self._held_labware)
+    return PodPose(d.to_value("X", x), gripper)
+
+  def _require_declared(self) -> PodConfiguration:
+    if self.declared is None:
+      raise RuntimeError(f"{self} has no declared configuration")
+    return self.declared
+
+  def add_position_listener(self, listener: Callable[["Pod"], None]) -> Callable[[], None]:
+    """Call `listener(pod)` whenever the position record changes: after a move, a read, homing,
+    or a position becoming unknown. Returns what removes it. For what follows the pod, such as its
+    model in a resource tree (`BiomekI7`); a listener that raises is logged and kept."""
+    self._listeners.append(listener)
+    return lambda: self._listeners.remove(listener)
+
+  def _positions_changed(self) -> None:
+    self._tell_rail()
+    for listener in list(self._listeners):
+      try:
+        listener(self)
+      except Exception:
+        logger.exception("%s: position listener %r failed", self, listener)
+
+  def _tell_rail(self) -> None:
+    """Give the rail this pod's pose from the position record (unknown parts as unknown)."""
+    if self.rail is None or self.declared is None:
+      return
+    x = self._cpositions["X"][0]
+    pose = None
+    if x is not None:
+      pose = self._rail_pose(x, self._cpositions["GR"][0], self._cpositions["GG"][0])
+    self.rail.update(self.side, pose)
+
+  async def request_rail_pose(self) -> PodPose:
+    """Where the pod is along the rail, as its drives report X, GR and GG. Moves nothing."""
+    axes = [self.axis(n) for n in ("X", "GR", "GG")]
+    replies = await self.board.send_many([p.get_current_position(a.device, a.index) for a in axes])
+    x, gr, gg = (p.parse_s32(r.payload) for r in replies)
+    return self._rail_pose(x, gr, gg)
+
+  async def move_axes(
+    self,
+    targets: Mapping[str, int],
+    speed: int = 1000,
+    forces: Optional[Mapping[str, float]] = None,
+    sensors: Optional[Mapping[str, Tuple[int, int]]] = None,
+  ) -> MoveResult:
+    """Move several axes together so they arrive at once: Biomek's `AM` (with `SF` force limits and
+    sensor stops). The slowest axis moves at its limits x
+    speed / 1000, the others scaled to match; axes already at their target stay put.
+
+    Targets are in counts. On the Span-8 Z channels they are adjusted positions (the channel's
+    hysteresis is added to downward moves, as Biomek does). Syringe pumps move through the valve
+    each was last set to (`pipettes.set_valves`), at the cutoff velocity
+    (`pipettes.set_cutoff_velocity`).
+
+    A move of X, GR or GG is checked against the other pod first (`driver/x_rail.py`). One that
+    would run into it is refused, and nothing is sent. One crossing only the path of the other
+    pod's move in flight waits for that move to finish. Whether the pod may move now (interlock
+    armed) is the caller's to decide.
+
+    Args:
+      targets: target per axis name. On a Span-8, also `Y` (channel 1) and `S` (the span from
+        channel 1 to 8), as Biomek sends them: they set Y1-Y8 as the Master Controller does
+        (`motion.span_targets`), and cannot be given with Y1-Y8.
+      speed: 1..1000, Biomek's speed field.
+      forces: force limit per axis, in the Master Controller's units (its `SF`; sent x1000). The
+        axis stops where that force stalls it (a grip, a tip pressed on); its position is then
+        not known until read, which the next move does.
+      sensors: per axis, the (sensor, trigger) that stops it where the sensor fires (a Span-8 Z
+        sensing liquid). Where it stopped is in the result and becomes the axis's position, as
+        the Master Controller keeps it. Whether liquid not sensed or a clot is an
+        error is the caller's to decide (the Master Controller fails the `AM` for the first and
+        reports the second).
+
+    Returns:
+      The motions sent and how the axes ended.
+
+    Raises:
+      ValueError: for an unknown axis, a target outside an axis's limits, a force or sensor on an
+        axis without a target, or a speed outside 1..1000; nothing is sent.
+      RuntimeError: for a pump whose valve this driver has not set; nothing is sent.
+      NotHomedError: if an axis has not been homed; its pending moves are dropped.
+      RailCollisionError: if X, GR or GG would move into the other pod's range; nothing is sent.
+    """
+    forces, sensors = dict(forces or {}), dict(sensors or {})
+    targets = dict(targets)
+    if self.module_type == "span8" and ("Y" in targets or "S" in targets):
+      channels = sorted(n for n in targets if n in {f"Y{i}" for i in range(1, 9)})
+      if channels:
+        raise ValueError(f"{self}: Y or S with {channels}; give one or the other")
+      y, span = targets.pop("Y", None), targets.pop("S", None)
+      targets.update(motion.span_targets(self._cpositions, y, span))
+    if not 1 <= speed <= 1000:
+      raise ValueError(f"speed {speed} is outside 1..1000")
+    for name, target in targets.items():
+      axis = self.axis(name)
+      axis.check_position(target)
+      if axis.is_pump and self._valves[name] is None:
+        raise RuntimeError(
+          f"{self}: {name}'s valve has not been set; call `pipettes.set_valves` first"
+        )
+    stray = sorted({*forces, *sensors} - set(targets))
+    if stray:
+      raise ValueError(f"{self}: a force or sensor on {stray}, which have no target")
+    for name, force in forces.items():
+      if self.axis(name).is_pump or not 0 <= force <= p.MAX_FORCE:
+        raise ValueError(
+          f"{self}: force {force} on {name}: not a motor, or outside 0..{p.MAX_FORCE}"
+        )
+    uses_pumps = any(self.axis(n).is_pump for n in targets)
+    try:
+      await self._read_unknown_positions(pumps=uses_pumps)
+      motions, timeout_ms, after = motion.plan_move(
+        self.axes, self._cpositions, targets, speed, self._cutoff_velocity
+      )
+      logger.info(
+        "%s AM %s speed %d%s: %d axes move, Move All timeout %d ms",
+        self.component,
+        " ".join(f"{n}={t}" for n, t in targets.items()),
+        speed,
+        "".join(f" SF {n} {f}" for n, f in forces.items()),
+        len(motions),
+        timeout_ms,
+      )
+      if not motions:
+        return MoveResult()
+      if self.rail is not None and any(m.axis in RAIL_AXES for m in motions):
+        start = self._rail_pose(*(self._cpositions[n][0] or 0 for n in RAIL_AXES))
+        end_counts = [after[n][0] or 0 for n in RAIL_AXES]
+        if "GG" in forces:  # stops on what it grips, short of its target: count the wider end
+          end_counts[2] = max(end_counts[2], self._cpositions["GG"][0] or 0)
+        end = self._rail_pose(*end_counts)
+        async with self.rail.moving(self.side, start, end):
+          completions = await self._send_motions(motions, timeout_ms, forces, sensors)
+      else:
+        completions = await self._send_motions(motions, timeout_ms, forces, sensors)
+    except RailCollisionError:
+      raise  # refused before anything was sent: every position is as it was
+    except BaseException as e:
+      # As the Master Controller after a failed command, and its reply, so a
+      # session's log reads as Biomek's: "#AM The left X motion failed: ...".
+      self._forget_positions()
+      if isinstance(e, AceError):
+        names = {(a.device, a.index): f"{self.side} {a.name}" for a in self.axes}
+        logger.error("%s #AM %s", self.component, english(e, names))
+      raise
+    before = self._cpositions
+    self._cpositions = after
+    # Force stopped these short of where they were sent: as the Master Controller does, their
+    # positions become unknown (adjusted as before), read before the next move.
+    if forces:
+      self._forget_positions(forces, before)
+    # A sensor stop reports where it stopped; the Master Controller takes that as the position.
+    for name, complete in completions.items():
+      if complete.position is not None and name not in forces:
+        axis = self.axis(name)
+        self._cpositions[name] = motion.update_cpos(
+          self._cpositions[name], complete.position, axis.hysteresis
+        )
+    self._positions_changed()
+    return MoveResult(list(motions), completions)
+
+  # -- travel over the deck (design.md B9) -------------------------------------------
+
+  @property
+  def channel_z_axes(self) -> List[str]:
+    """The axes whose height is the channels' bottom: `Z` on a Multichannel, `Z1`-`Z8` on a Span-8."""
+    return [
+      a.name for a in self.axes if a.name == "Z" or (a.name[0] == "Z" and a.name[1:].isdigit())
+    ]
+
+  def default_traverse_heights(self) -> Dict[str, float]:
+    """The height each Z-type axis (the channels' and the gripper's GZ) travels at by default, cm
+    of its bottom above the deck: its ceiling (`traverse_ceilings`), or
+    `default_minimum_traverse_height` where that is lower."""
+    ceilings = self.traverse_ceilings()
+    wanted = self.default_minimum_traverse_height
+    return {
+      name: top if wanted is None or name == "GZ" else min(wanted, top)
+      for name, top in ceilings.items()
+    }
+
+  def traverse_ceilings(self) -> Dict[str, float]:
+    """The highest each Z-type axis travels, cm of its bottom above the deck: the top of travel less
+    the park margin (`ParkLocation` `ZMargin`, `GZMargin`), as Biomek parks them (the
+    Multichannel's rest Z, 39.763 cm, is -256 counts). A Span-8 probe goes no higher than its top
+    less `DiscardOffset`: above that its stripper pushes a tip off (Biomek travels carrying probes
+    there, as its logs show)."""
+    d = self._require_declared()
+    shuck = d.settings.get("DiscardOffset") if self.module_type == "span8" else None
+    ceilings = {}
+    for name in self.channel_z_axes + ["GZ"]:
+      top = d.limits[name][1]
+      ceiling = top + d.park.get("GZMargin" if name == "GZ" else "ZMargin", 0.0)
+      if shuck is not None and name != "GZ":
+        ceiling = min(ceiling, top - shuck)
+      ceilings[name] = ceiling
+    return ceilings
+
+  async def move_over(
+    self,
+    targets: Mapping[str, int],
+    speed: int = 1000,
+    minimum_traverse_height: Optional[float] = None,
+    z_final: Optional[float] = None,
+    clearance: Optional[float] = None,
+    allow_below_clearance: bool = False,
+    tip_lengths: Optional[Mapping[str, float]] = None,
+  ) -> MoveResult:
+    """Travel to `targets` (X, Y and the like, in counts, as `move_axes` takes them) clear of the
+    deck: lift the channels and the gripper to a traverse height, move, then optionally set the
+    channels to `z_final`. STAR's `minimum_traverse_height_at_beginning_of_a_command` and
+    `z_final`, and Biomek's Safe Height; design.md B9. Heights here are Biomek's frame, cm above
+    the deck surface, and are each channel's lowest point, as STAR's are: the end of the tip it
+    carries (`tip_lengths`), else its bottom. An axis already above its traverse height is not
+    lowered.
+
+    Args:
+      targets: the travel's targets; channel Z axes in them are refused (use `z_final`).
+      speed: as `move_axes`, for every step.
+      minimum_traverse_height: the channels' lowest points while traveling. Default: each channel
+        at `default_traverse_heights` (as high as it goes). The gripper travels at its default
+        always.
+      z_final: where to set the channels' bottoms once there; None leaves them at the traverse
+        height.
+      clearance: the lowest height the deck under the path allows, from the deck model
+        (`BiomekI7.traverse_clearance`), if known.
+      allow_below_clearance: travel lower than `clearance` and the obstacles allow, deliberately.
+      tip_lengths: per channel Z axis, how far below its bottom the tip it carries ends, cm. The
+        pod's own record when None (`carried_tip_lengths`).
+
+    Raises:
+      ValueError: for a channel Z axis in `targets`; for a path through a wall (a shield, a
+        tower, the light curtain); for a traverse height below what the path needs (unless
+        `allow_below_clearance`), a need above what the channels reach, or a height a channel
+        cannot lift its tip to (under its `traverse_ceilings`). Nothing is sent.
+    """
+    d = self._require_declared()
+    channels = self.channel_z_axes
+    stray = sorted(set(targets) & set(channels))
+    if stray:
+      raise ValueError(f"{self}: {stray} in a travel's targets; use z_final")
+    lengths = self.carried_tip_lengths() if tip_lengths is None else dict(tip_lengths)
+    await self._read_unknown_positions()
+    area = self._travel_area(targets)
+    need = g.obstacle_clearance(d.obstacles, *area)
+    if need.walls:
+      raise ValueError(f"{self}: the travel would pass through {', '.join(need.walls)}")
+    required = max(need.height, -math.inf if clearance is None else clearance)
+    heights, reach, traverse = self.traverse_targets(minimum_traverse_height, lengths)
+    if required > reach:
+      raise ValueError(f"{self}: the path needs {required:.3f} cm, above what the channels reach")
+    if traverse < required and not allow_below_clearance:
+      raise ValueError(
+        f"{self}: traverse height {traverse:.3f} cm is below the {required:.3f} cm the path needs;"
+        " pass allow_below_clearance=True to travel lower deliberately"
+      )
+    await self._raise_to(heights, speed)
+    result = await self.move_axes(targets, speed)
+    if z_final is not None:
+      await self.move_axes({n: d.to_counts(n, z_final) for n in channels}, speed)
+    return result
+
+  def carried_tip_lengths(self) -> Dict[str, float]:
+    """Per channel Z axis carrying a tip, how far below the channel the tip ends, cm: from the
+    head's or the probes' tip record (the session state).
+
+    Raises:
+      RuntimeError: for a carried tip whose length is not known.
+    """
+    feature = self.head96 if self.head96 is not None else self.pipettes
+    return {} if feature is None else feature.carried_tip_lengths()
+
+  def traverse_targets(
+    self, minimum_traverse_height: Optional[float], tip_lengths: Mapping[str, float]
+  ) -> Tuple[Dict[str, float], float, float]:
+    """Where each Z-type axis's bottom goes to travel, cm; the highest every channel's lowest point
+    reaches; and how high the lowest one travels. By default each at `default_traverse_heights`
+    (defined on the bottoms: the tips do not change where they go); given a height, the channels'
+    lowest points there (a channel's bottom at the height + its tip's length, `tip_lengths`).
+
+    Raises:
+      ValueError: for a height a channel cannot lift its tip to.
+    """
+    channels = self.channel_z_axes
+    lengths = {n: tip_lengths.get(n, 0.0) for n in channels}
+    heights = self.default_traverse_heights()
+    ceilings = self.traverse_ceilings()
+    reach = min(ceilings[n] - lengths[n] for n in channels)
+    if minimum_traverse_height is None:
+      return heights, reach, min(heights[n] - lengths[n] for n in channels)
+    short = {
+      n: round(ceilings[n] - lengths[n], 4)
+      for n in channels
+      if minimum_traverse_height + lengths[n] > ceilings[n] + 1e-9
+    }
+    if short:
+      raise ValueError(
+        f"{self}: traverse height {minimum_traverse_height:.3f} cm is above what the channels"
+        f" reach with their tips: {short}"
+      )
+    heights.update({n: minimum_traverse_height + lengths[n] for n in channels})
+    return heights, reach, minimum_traverse_height
+
+  async def lift_channels(
+    self,
+    minimum_traverse_height: Optional[float] = None,
+    tip_lengths: Optional[Mapping[str, float]] = None,
+    speed: int = 1000,
+  ) -> None:
+    """Raise the channels (not the gripper) where they stand to a traverse height, as `move_over`
+    does before traveling (the same meaning of heights, the same tips); never lower.
+
+    Raises:
+      ValueError: for a height a channel cannot lift its tip to. Nothing is sent.
+    """
+    lengths = self.carried_tip_lengths() if tip_lengths is None else tip_lengths
+    heights, _, _ = self.traverse_targets(minimum_traverse_height, lengths)
+    await self._read_unknown_positions()
+    await self._raise_to({n: heights[n] for n in self.channel_z_axes}, speed)
+
+  async def _raise_to(self, heights: Mapping[str, float], speed: int) -> None:
+    """Move the axes below their `heights` (cm) up to them, together."""
+    d = self._require_declared()
+    lift = {}
+    for name, height in heights.items():
+      counts = d.to_counts(name, height)
+      if self._cpositions[name][1] < counts:  # counts grow with height on every Z-type axis
+        lift[name] = counts
+    if lift:
+      await self.move_axes(lift, speed)
+
+  def _travel_area(self, targets: Mapping[str, int]) -> Tuple[g.Range, g.Range]:
+    """The X/Y area the pod's body covers from where it is to `targets`, cm."""
+    d = self._require_declared()
+    y_axis = "Y" if self.module_type == "multichannel" else "Y1"
+    x0 = d.to_value("X", self._cpositions["X"][1])
+    y0 = d.to_value("Y", self._cpositions[y_axis][1])
+    x1 = d.to_value("X", targets.get("X", self._cpositions["X"][1]))
+    y1 = d.to_value("Y", targets.get("Y", targets.get(y_axis, self._cpositions[y_axis][1])))
+    (ax, ay), (bx, by) = g.pod_xy_box(d.geometry, x0, y0), g.pod_xy_box(d.geometry, x1, y1)
+    return g.union(ax, bx), g.union(ay, by)
+
+  async def _send_motions(
+    self,
+    motions: Sequence[motion.Motion],
+    timeout_ms: int,
+    forces: Mapping[str, float],
+    sensors: Mapping[str, Tuple[int, int]],
+  ) -> Dict[str, p.MotionComplete]:
+    """Set each motion's parameters, then start them together and wait for them to finish.
+    Returns, per axis, its report when it was not a plain finish.
+
+    The parameters go out in the order the Master Controller's requests reach the board
+    (`motion.spawn_order`), motors and pumps together, so a session's traffic lines up with
+    Biomek's request for request."""
+    moves = []
+    for m in motion.spawn_order(motions):
+      sensor, trigger = sensors.get(m.axis, (0, 0))
+      moves.append(
+        AxisMove(
+          m.axis,
+          m.position,
+          m.velocity,
+          m.acceleration,
+          m.jerk or 0,
+          round(forces.get(m.axis, 0.0) * 1000),
+          sensor,
+          trigger,
+        )
+      )
+    accepted = await self._unchecked_fw_set_move_parameters(moves)
+    if not all(accepted):
+      await self._unchecked_fw_stop_motion()
+      refused = [m.axis for m, ok in zip(moves, accepted) if not ok]
+      raise NotHomedError(0x32, None, f"{self}: {refused} not homed")
+    reports = await self._unchecked_fw_move_all(timeout_ms)
+    names = {(a.device, a.index): a.name for a in self.axes}
+    return {
+      names[(c.device, c.index)]: c
+      for c in reports
+      if (c.device, c.index) in names and c.outcome != "done"
+    }
+
+  # -- drive commands ----------------------------------------------------------
+  # The only way this driver commands a drive: one request, or one batch sent together, each. They
+  # check targets against the axis's limits and nothing else. Whether an axis may move now (homed,
+  # interlock armed, clear of the other pod) is the caller's to decide, as homing does by asking
+  # the board.
+
+  async def _unchecked_fw_enable(self, axes: Sequence[str]) -> None:
+    """Set State ENABLED on each axis, sent together. On a drive in fault this is also the fault
+    reset; one that cannot come up answers an error and stays in fault."""
+    if axes:
+      targets = [self.axis(name) for name in axes]
+      await self.board.send_many(
+        [p.set_state_enabled(a.device, a.index) for a in targets],
+        timeout=5.0 + ENABLE_SECONDS_PER_AXIS * len(targets),
+      )
+
+  async def _unchecked_fw_set_move_parameters(self, moves: Sequence[AxisMove]) -> List[bool]:
+    """Set each axis's next move, sent together in the order given. Returns, per move, whether the
+    board took it (True) or refused it because the axis has not been homed since power-up (False).
+
+    A syringe pump's move is sent as the Span-8's `move` does: the pump's minimum start velocity,
+    the move's velocity and acceleration, the cutoff velocity clamped to the pump's range, and the
+    valve as last set; its jerk, force and sensor are not sent.
+
+    Raises:
+      ValueError: for a target outside the axis's limits; nothing is sent.
+      RuntimeError: for a pump whose valve has not been set; nothing is sent.
+      AceError: for any refusal other than "not homed".
+    """
+    requests = []
+    for move in moves:
+      axis = self.axis(move.axis)
+      axis.check_position(move.position)
+      limits = axis.limits
+      velocity = limits.max_velocity if move.velocity is None else move.velocity
+      acceleration = limits.max_acceleration if move.acceleration is None else move.acceleration
+      if axis.is_pump:
+        valve = self._valves[move.axis]
+        if valve is None:
+          raise RuntimeError(f"{self}: {move.axis}'s valve has not been set")
+        pump = axis.pump_limits
+        cutoff = int(
+          motion.range_(pump.min_cutoff_velocity, self._cutoff_velocity, pump.max_cutoff_velocity)
+        )
+        requests.append(
+          p.set_pump_move_parameters(
+            axis.index,
+            move.position,
+            pump.min_start_velocity,
+            velocity,
+            cutoff,
+            acceleration,
+            valve,
+          )
+        )
+        continue
+      requests.append(
+        p.set_motor_move_parameters(
+          axis.index,
+          move.position,
+          velocity,
+          acceleration,
+          limits.max_jerk if move.jerk is None else move.jerk,
+          move.force,
+          move.sensor,
+          move.trigger,
+        )
+      )
+    replies = await self.board.send_many(requests, raise_errors=False)
+    accepted = []
+    for move, reply in zip(moves, replies):
+      try:
+        reply.raise_for_error(f"{self}: Set {move.axis} Move Parameters")
+        accepted.append(True)
+      except NotHomedError:
+        accepted.append(False)
+    return accepted
+
+  async def _unchecked_fw_move(self, axis: str, timeout_ms: int = MOVE_TIMEOUT_MS) -> None:
+    """Start one axis's move to the parameters set for it, and wait for it to finish."""
+    await self.board.send(
+      p.move(self.axis(axis).index, timeout_ms), timeout=timeout_ms / 1000 + 5.0
+    )
+
+  async def _unchecked_fw_move_all(
+    self, timeout_ms: int = MOVE_ALL_TIMEOUT_MS
+  ) -> List[p.MotionComplete]:
+    """Start every axis whose move parameters were set since its last move, together, and wait for
+    all of them to finish. Returns the reports the axes sent under the Move All."""
+    reply = await self.board.send(p.move_all(timeout_ms), timeout=timeout_ms / 1000 + 5.0)
+    return [p.parse_motion_complete(r) for r in reply.related]
+
+  async def _unchecked_fw_home(self, axes: Sequence[str]) -> None:
+    """Home the axes, sent together, and wait for every one to finish."""
+    targets = [self.axis(name) for name in axes]
+    await self.board.send_many(
+      [p.home(a.device, a.index) for a in targets], timeout=HOME_REPLY_TIMEOUT
+    )
+
+  async def _unchecked_fw_stop_motion(self) -> None:
+    """Stop Motion Service on this pod's board: stops every axis and drops pending moves."""
+    await self.board.send(p.stop_motion_service())
+
+  async def _unchecked_fw_configure(self, axis: Axis) -> None:
+    """Load one axis's motor table (Configure). Leaves it disabled and not homed."""
+    await self.board.send(p.configure(axis.device, axis.index, axis.configure))
+
+  async def _unchecked_fw_stop_module_execution(self) -> None:
+    await self.board.send(p.stop_module_execution())
