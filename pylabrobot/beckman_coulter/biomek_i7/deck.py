@@ -8,7 +8,7 @@ deck's frame is PyLabRobot's, millimetres with Y towards the back, origin at the
   y = FRAME_Y - Y
 """
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from pylabrobot.beckman_coulter.biomek_i7.resource_model.alps import BiomekALP
 from pylabrobot.beckman_coulter.biomek_i7.resource_model.units import cm
@@ -64,7 +64,9 @@ def deck_y(y: float) -> float:
 class BiomekI7Deck(Deck):
   """The deck of a Biomek i7: ALPs placed by pin, and their positions found by Biomek's names."""
 
-  def __init__(self, name: str = "deck"):
+  def __init__(self, name: str = "deck", **kwargs: Any):
+    """`kwargs`: what `serialize` writes besides the name (the deck's fixed size and category);
+    taken so a saved deck loads (`Resource.load_from_json_file`), and otherwise ignored."""
     super().__init__(
       name=name,
       size_x=DECK_SIZE_X,
@@ -72,7 +74,11 @@ class BiomekI7Deck(Deck):
       size_z=DECK_SIZE_Z,
       category="deck",
     )
-    self.alps: Dict[str, BiomekALP] = {}
+
+  @property
+  def alps(self) -> Dict[str, BiomekALP]:
+    """The ALPs on the deck, by name."""
+    return {c.name: c for c in self.children if isinstance(c, BiomekALP)}
 
   @staticmethod
   def pin_location(column: int, row: int) -> Coordinate:
@@ -96,7 +102,6 @@ class BiomekI7Deck(Deck):
   def assign_alp(self, alp: BiomekALP, column: int, row: int) -> None:
     """Place `alp` with its left pins in pin `column` and its front pins in pin `row`."""
     self.assign_child_resource(alp, location=self.alp_location(alp, column, row))
-    self.alps[alp.name] = alp
 
   def get_position(self, name: str) -> ResourceHolder:
     """A deck position by Biomek's name for it (`P1`, `TL1`, `TR1`)."""

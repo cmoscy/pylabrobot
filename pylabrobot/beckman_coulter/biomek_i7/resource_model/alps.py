@@ -44,6 +44,8 @@ class Site(NamedTuple):
     labware_offsets: where labware of a class (Biomek's name) sits from where it would otherwise,
       as (right, forward, up).
     tip_disposal: where the pods discard tips, for a trash.
+    head96_tip_loading: whether the 96-head may load tips here (the position's characteristic
+      "Multichannel Can Load Tips": only the tip-loading ALP's, built to take the press).
   """
 
   key: str
@@ -55,6 +57,7 @@ class Site(NamedTuple):
   size_y: float
   labware_offsets: Optional[Dict[str, Tuple[float, float, float]]] = None
   tip_disposal: Optional["TipDisposal"] = None
+  head96_tip_loading: bool = False
 
 
 class TipDisposal(NamedTuple):
@@ -92,6 +95,7 @@ class BiomekPosition(ResourceHolder):
   Attributes:
     labware_offsets: by Biomek class name, Biomek's (right, forward, up), cm.
     tip_disposal: for a trash, where the pods discard tips.
+    head96_tip_loading: whether the 96-head may load tips here (`Site.head96_tip_loading`).
   """
 
   def __init__(
@@ -102,9 +106,11 @@ class BiomekPosition(ResourceHolder):
     size_z: float,
     labware_offsets: Optional[Mapping[str, Sequence[float]]] = None,
     tip_disposal: Optional[Sequence[float]] = None,
+    head96_tip_loading: bool = False,
     **kwargs: Any,
   ):
     super().__init__(name=name, size_x=size_x, size_y=size_y, size_z=size_z, **kwargs)
+    self.head96_tip_loading = head96_tip_loading
     self.labware_offsets: Dict[str, Tuple[float, float, float]] = {
       k: (float(v[0]), float(v[1]), float(v[2])) for k, v in (labware_offsets or {}).items()
     }
@@ -132,6 +138,7 @@ class BiomekPosition(ResourceHolder):
       **super().serialize(),
       "labware_offsets": {k: list(v) for k, v in self.labware_offsets.items()},
       "tip_disposal": None if self.tip_disposal is None else list(self.tip_disposal),
+      "head96_tip_loading": self.head96_tip_loading,
     }
 
 
@@ -155,10 +162,11 @@ class BiomekALP(Carrier[ResourceHolder]):
     size_z: float,
     pin_count: Tuple[int, int],
     pin_offset: Tuple[float, float],
-    sites: Dict[int, ResourceHolder],
-    site_keys: List[str],
-    base_names: Dict[str, str],
+    sites: Optional[Dict[int, ResourceHolder]] = None,
+    site_keys: Optional[List[str]] = None,
+    base_names: Optional[Dict[str, str]] = None,
     alp_type: Optional[str] = None,
+    **kwargs: Any,
   ):
     """
     Args:
@@ -172,6 +180,8 @@ class BiomekALP(Carrier[ResourceHolder]):
       site_keys: Biomek's key for each site, in index order.
       base_names: what Biomek numbers each site under on a deck, by key.
       alp_type: the ALP type, as Biomek names it (`Static1x1`). The model is this, namespaced.
+      kwargs: what `serialize` writes besides these (category, model), taken so a saved deck loads;
+        a loaded ALP's sites come back as its children.
     """
     super().__init__(
       name=name,
@@ -185,8 +195,8 @@ class BiomekALP(Carrier[ResourceHolder]):
     self.alp_type = alp_type
     self.pin_count = pin_count
     self.pin_offset = pin_offset
-    self.site_keys = site_keys
-    self.base_names = base_names
+    self.site_keys = site_keys or []
+    self.base_names = base_names or {}
 
   def get_site(self, key: str) -> ResourceHolder:
     """The site Biomek calls `key` on this ALP (`A1`)."""
@@ -232,6 +242,7 @@ def _alp(
       size_z=0,
       labware_offsets=site.labware_offsets,
       tip_disposal=site.tip_disposal,
+      head96_tip_loading=site.head96_tip_loading,
     )
     # Carrier places a site at its own `location`. Biomek measures from the back edge.
     holder.location = Coordinate(
@@ -358,7 +369,18 @@ def biomek_tip_load_1x1(name: str, position_names: Names = None) -> BiomekALP:
     size=(13.701, 9.472, 16.129),  # XSpan, YSpan, ZSpan
     pin_count=(7, 5),
     pin_offset=(0.602, 0.57),
-    sites=[Site("A1", "TL", 0.441, 0.441, 0.0, *_PLATE_SITE, labware_offsets=offsets)],
+    sites=[
+      Site(
+        "A1",
+        "TL",
+        0.441,
+        0.441,
+        0.0,
+        *_PLATE_SITE,
+        labware_offsets=offsets,
+        head96_tip_loading=True,
+      )
+    ],
     position_names=position_names,
   )
 
