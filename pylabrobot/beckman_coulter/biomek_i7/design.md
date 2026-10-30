@@ -43,6 +43,9 @@ driver/features/     chassis.py; pod.py (one per pod, the STAR's X-arm); head96.
                      gripper.py on the pods; homing.py and tip_load.py, the MC's multi-step
                      commands as recipes.
 driver/simulator.py  A simulated instrument at the wire: each axis, the interlock, the door.
+                     Moves are instant, or take the instrument's time (`time_scale`, from each
+                     move's distance, speed and acceleration) so a run can be watched; the Span-8's
+                     tip sensor can report the session's tips (`sense_recorded_tips`).
 ```
 
 No instrument's data ships with the package: its declared configuration (motor tables, per pod
@@ -146,8 +149,9 @@ stops them colliding. The rule is Biomek's own, checked against every move it lo
 - before a pod moves, its swept range (start pose ∪ end pose) must not overlap the other pod's
   range or a move the other pod has in flight;
 - a move crossing only the path of the other pod's running move waits for it to finish;
-- otherwise the move is refused before anything is sent, or (later) the other pod is moved clear
-  first, as Biomek does.
+- otherwise the move is refused before anything is sent. Biomek moves the other pod clear first;
+  that is deferred (tracker phase 4d). Until then a caller makes room explicitly:
+  `Pod.move_aside()` takes a pod to its own end of the rail, `Pod.park()` to its park.
 
 Every move of X, GR or GG goes through it. The same gripper model sizes the gripper in the
 resource tree (phase 5), so the visualizer shows what the guard counts.
@@ -268,7 +272,9 @@ PyLabRobot's labware definitions differ from Biomek's classes (≤ 0.1 mm).
 reservoirs from Biomek's labware and tip classes (`biomek_labware(class, name)`, data in
 `biomek_labware.json`), and `layouts.place_labware` places a method's Instrument Setup. Targets then
 match Biomek's logged moves to 0.0015 cm, which hand-made stand-in definitions do not (−0.0095 cm
-with BCFlat96 for Thermo96VB_PP).
+with BCFlat96 for Thermo96VB_PP). A well's shape (`well_profile`) follows Biomek's segments by their
+radii (a round bottom is a spherical cap; a reservoir section a box): every segment's own
+`sectionvolume` comes out, and so do the logged liquid levels.
 
 **B5c. Where a tip's end is, from Biomek's definitions**, checked against the logged tip moves. No
 constant here is fitted:
@@ -366,27 +372,42 @@ across instruments; Biomek's own knobs are keyword-only extras.
 | Feature | Methods (STAR shape) | State | Built from |
 |---|---|---|---|
 | `head96` | `pick_up_tips(tip_rack, offset, minimum_traverse_height_start/_end, *, channel, tip_spot)`, `drop_tips`, `discard_tips(trash)`; heights mm of the lowest point (B6) | built, replayed against every logged one; not run on hardware | `LT` (`TipLoad.from_configuration`), B5c, the eject (D to its lower limit while Z rises the stroke, then shucks) |
-| `head96` | `aspirate(resource, volume, offset, liquid_height, lld_mode, flow_rate, *, technique, ...)`, `dispense(...)` | designed | technique values (below), the height rule, D moves at the converted flow rate |
+| `head96` | `aspirate(resource, volume, offset, liquid_height, lld_mode, flow_rate, *, height_from, follow_liquid, minimum_height, z_speed, approach_height, settling_time, blow_out_air_volume, transport_air_volume, conditioning, tip_touch, minimum_traverse_height_start/_end)`, `dispense(..., blow_out_delay, empty)`; a 96-well plate (A1 over A1) or one container (the head centred) | built, replayed against every logged one (103/103, 104/104); not run on hardware | the templates (`features/liquid.py`): Biomek's height rule and touch-off, the wells' shapes (`WellProfile`), checked against every logged aspirate and dispense |
 | `pipettes` (Span-8) | `pick_up_tips(tip_spots, use_channels, offsets, minimum_traverse_height_start/_end)`, `discard_tips(use_channels, trash, ...)`; `drop_tips` raises (the stripper works only at the top of travel: tips go to waste) | built, replayed against every logged load and discard (`tools/validate_span8_tips.py`); not run on hardware | Biomek's load (approach, presses grouped by `MaxLoadingProbes`/`MinLoadingInterval` to the seat, the top + `TipLoadZOffset` + `LoadingOffsets`, exit the top + 1.0) and shuck (over the trash's Span-8 offsets at `DiscardHeight` − 1, groups of `MaxUnloadingProbes` to the top of travel and back), then `VT` with `DetectTips` |
-| `pipettes` (Span-8) | `aspirate(containers, volumes, use_channels, resource_offsets, liquid_heights, lld_mode, flow_rates, *, technique, ...)`, `dispense(...)` | designed | as `head96`, per probe (D per probe; Z per probe); LLS (`SS`) as `lld_mode=CAPACITIVE`; cutoff velocity (`CV`) |
+| `pipettes` (Span-8) | `aspirate(containers, volumes, use_channels, resource_offsets, liquid_heights, lld_mode, flow_rates, *, ..., cutoff_velocity, lls_sensitivity)`, `dispense(...)`; batches as `plan_pick_up`, probes sharing a container centred at the narrowest span | built, replayed (aspirates 1,099/1,105, dispenses 1,060/1,060); not run on hardware; LLS not built | as `head96`, per probe; `CV` before pump moves, `SS` before moves from the liquid, `VO 255` after; pumps floored at `SystemTrailingAirgap` |
+| `BiomekI7` | `setup(..., discard_tips=True, park=True)`, `home_all()`, `park()`; built from files: `BiomekI7(deck, simulation, configuration_json, simulator_recording, state_json, simulate_motion_time, motion_time_scale)` | built; setup, park and the prime replayed in the simulator; not run on hardware | setup as Biomek's Home All, then STAR's tip discard (the Span-8 by its tip sensor, the 96-head by the session state: it has no sensor); park as logged after Home All and a prime (`ParkLocation`; a Span-8 over its wash station), equal on every axis of both pods |
+| `Pod` | `park(over)`, `move_aside()` | built (simulator) | `park`: X `XMargin` in from its end, `Y`, channels at the top + `ZMargin` (a Span-8's less `DiscardOffset`), gripper `GR`/`GY` then `GG`. `move_aside`: the interim way to make room on the rail, which refuses rather than moving the other pod (tracker 4d) |
+| `pipettes` (Span-8) | `start_prime(wash, strokes)`, `stop_prime()`, `prime(strokes)`, `home_pumps()` | built, its moves equal to the logged prime's (`driver/prime_tests.py`); not run on hardware | Biomek's prime dialog (the pumps homed, strokes until the operator stops it), as logged (2026-10-09): probes to the wash position's height at 250, `HD` (one Home of D1 homes the eight), full strokes `VI`/draw/`VO`/push at `D1SpeedLimit`, then the probes up and the air gap at 10, and park. A stroke takes at least `minimum_stroke_seconds` (1 s; about 4.4 s on the instrument), so an instant simulator does not stroke hundreds of times a second |
 | `gripper` | `pick_up_resource`, `place_resource` (alias `drop_resource`), `move_resource` | designed | force-limited GG close and `check_grip`; GY/GZ/GR moves; `lib.pick_and_place`; the rail guard counts held labware |
 
-**Techniques are Biomek's liquid classes.** A technique (project database folder "Techniques", e.g.
-"MC P1200 High", "S8 1000 Medium"; a method step can embed a custom copy) holds aspirate, dispense,
-mix and general values and a volume calibration. A `technique=` keyword supplies defaults, and an
-explicit argument overrides, as STAR's `hamilton_liquid_class` does ("the class's value, else the
-default"). How they map:
+**Biomek's techniques and liquid types are a translation layer.** The features take PyLabRobot's
+arguments only. Biomek splits what STAR keeps in a liquid class plus call arguments in two project
+records: a **liquid type** (`Water`: flow rates, delays, blowout and trailing air volumes, cutoff
+velocity, prewet overage, tip-touch defaults) and a **technique** (`MC P1200 High`, or a method step's
+own `[Custom]` copy: per operation the height and what it is from, Follow Liquid, Z speed and the
+switches; minimum height, conditioning, LLS and clot settings, calibration; and its own copy of the
+liquid type's values, used when `overrideliquidtypesettings` is set). `techniques.py` reads both as
+plain records (JSON, by path, as the configuration; `tools/export_techniques.py` exports them) and
+`aspirate_arguments(technique, liquid_type)` / `dispense_arguments` return the keyword arguments
+they stand for, which a caller splats and overrides (`**{**args, "flow_rate": 50}`). There is no
+`technique=` keyword and no auto-selection by rank. How they map:
 
-| PyLabRobot / STAR | Biomek technique |
+| PyLabRobot argument | Biomek |
 |---|---|
-| `flow_rate` µL/s | aspirate/dispense speed µL/s; the `AM` speed field is µL/s × counts/µL ÷ D's maximum (196,608 counts/s): 100 → 11.7 %, 125 → 14.6 %, exact in the log |
-| `liquid_height` (mm above the cavity bottom) | Height (mm) from Bottom; from Top converts with the labware's depth; from Liquid needs the liquid level (PyLabRobot volume tracking with the well's height-volume functions, or LLS) |
-| surface following | Follow Liquid (the tip tracks the level as it draws or dispenses) |
-| `minimum_allowed_z_position_during` (the floor) | Minimum Height (to confirm: 0.2 holds the logged reservoir aspirate 0.200 cm above the bottom) |
-| volume correction of a liquid class | CalibrationSlope / CalibrationOffset |
-| `blow_out_air_volume`, `transport_air_volume`, `settling_time`, `pre_wetting_volume`, `Mix` | blow-out, trailing air gap, delays, pre-wet, mix |
-| `offset` | position offsets, including the reservoir templates' aspirate offset (0.2 cm in X) |
-| keyword-only extras | tip touch (height, from, angle, speed), cutoff velocity, clot detection, piercing |
+| `flow_rate` uL/s | aspirate / dispense speed; the `AM` speed field is uL/s x counts/uL / the pump's maximum x 1000 (100 -> 117, 125 -> 146 on the 96-head; 50 -> 52 on the Span-8) |
+| `liquid_height` mm, `height_from` | Height (mm) from Bottom, Top (+ the well's depth) or Liquid (+ its level: needs volume tracking) |
+| `minimum_height` mm above the bottom | Minimum Height (mm; floors every template height) |
+| `follow_liquid` | Follow Liquid (the level's change from the well's segments) |
+| `z_speed` % | the technique's Speed (Z in the well, % of its maximum: an exception to B6's units, kept as Biomek states it) |
+| `settling_time` s | aspirate / dispense delay (ms) |
+| `blow_out_air_volume`, `blow_out_delay` | Blowout + blowout volume / delay |
+| `transport_air_volume` | Trailing Air Gap + its volume |
+| `conditioning` | conditioning sections, section volume, excess |
+| `tip_touch` (`TipTouch`: height, from, theta, speed, delay, `distance` mm) | Tip Touch; Biomek's distance (the wall at the touch height less its tip's cone at the rim) comes from `labware.biomek_touch_distance` for its labware; without a distance the driver goes to the wall at the touch height less the tip's radius. The wall comes from the container's volume function: its slope is the cross-section's area there, shaped like the top outline. The Prep driver builds its segments the same way. That gives Biomek's wall for 22 of its 25 well shapes (to 0.01 mm). It falls a little inside a round bottom under a square top, since a PyLabRobot well has one cross-section shape. PyLabRobot's `Tip` has no taper, only its widest diameter, so the tip's share of Biomek's distance stays in the helper |
+| `empty` | Empty Tips |
+| `cutoff_velocity`, `lls_sensitivity` (Span-8) | cutoff velocity, conductivity |
+| `offset`, `approach_height` | the reservoir templates' X offset (0.2 cm at 180 degrees) and the Span-8 reservoir approach (10 mm) |
+| not built (refused) | mix, prewet, `CalibrationSlope` / `CalibrationOffset`, LLS, clot detection |
 
 **Where Biomek and the shared interface part:**
 - The Span-8's probes share X and are spread evenly in Y by one span value (`motion.span_targets`),
@@ -396,8 +417,19 @@ default"). How they map:
   STAR's head.
 - Pipetting templates (the step's choreography: approach, touch-off, small Z moves around a
   dispense, multi-dispense, septum piercing) have no PyLabRobot counterpart. The standard ones ("MC
-  Pipetting", "S8 Pipetting") are what `aspirate`/`dispense` do; variants become keywords. The
-  templates are data (steps whose parameters are expressions such as `=C__Height`).
+  Pipetting", "S8 Pipetting") are what `aspirate`/`dispense` do (`features/liquid.py`); the reservoir
+  variants are `offset` + `approach_height`. The templates are project data (steplets whose
+  parameters are expressions such as `=C__Height`), checked against every logged aspirate and
+  dispense.
+- Heights from the liquid need the well's contents: PyLabRobot's volume trackers (on), as Biomek
+  needs known amounts (its data sets). The 96-head has one Z: the lowest any mandrel needs.
+- **Geometry comes through PyLabRobot only.** The features take any PyLabRobot container and tip:
+  the cavity bottom (`material_z_thickness`), depth, size and cross-section, `compute_height_from_volume`
+  (for heights from the liquid and following), the tip's length, fitting depth and diameter.
+  Biomek's labware is a converter into those constructs (`resource_model/labware.py`, with Biomek's
+  height <-> volume installed), and what Biomek computes from its own data beyond them (the touch-off
+  distance) is a helper that returns a plain argument. The log replay runs through the same
+  arguments a user passes.
 - Biomek's heights are in mm, its positions in cm: the API takes PyLabRobot's mm throughout.
 
 Parameters are keyword arguments defaulted from `default_*` class attributes (STAR P6, P18), seeded
@@ -407,6 +439,21 @@ configuration's conversions; every move passes through the rail guard and the tr
 
 **Not in this driver:** the deck's devices (shakers, Peltiers, the tilting ALP, the washer, the
 camera) are separate devices, or chassis features once their protocol is known.
+
+Two rules the operations keep that are not PyLabRobot's own:
+- **The 96-head loads tips only on a tip-loading position.** Its `LT` presses the whole box, which
+  Biomek allows only where the ALP's position has "Multichannel Can Load Tips" (only `TipLoad1x1`;
+  `BiomekPosition.head96_tip_loading`); `plan_pick_up` refuses elsewhere.
+- **Setup takes off tips left on**, as the STAR's does: the Span-8's by its tip sensor (a probe
+  with a tip the session did not record is taken to carry the longest Biomek tip, for its travel),
+  the 96-head's by the session state, since it has no tip sensor (`BiomekI7.setup(discard_tips=)`).
+- **Biomek labware saves and loads as plain PyLabRobot data**: a well built from a Biomek class
+  carries its height <-> volume as `height_volume_data` (a point every 0.1 mm where the
+  cross-section changes; within 0.003 mm of Biomek's height), and the deck, its ALPs and positions
+  deserialize, so a deck file (`Resource.load_from_json_file`) stands in for the code that built it.
+- **A carried tip is kept as PyLabRobot defines it** (`Tip.serialize`, in the session state), so a
+  tip of any definition is known again after a restart. A state written before names Biomek tip
+  classes only (`biomek_<class>`), and those are defined from the class when it loads.
 
 ## Where the code does not follow this yet
 

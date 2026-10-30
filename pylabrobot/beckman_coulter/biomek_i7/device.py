@@ -13,7 +13,7 @@ The frame here is the device resource's own: origin at the front left bottom cor
 """
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from pylabrobot.beckman_coulter.biomek_i7.deck import (
   FRAME_X,
@@ -26,15 +26,26 @@ from pylabrobot.beckman_coulter.biomek_i7.deck import (
 )
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.chassis import DoorState
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.gripper import Gripper
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.head96 import (
+  DEFAULT_TRASH as HEAD96_TRASH,
+)
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.head96 import Head96
+from pylabrobot.beckman_coulter.biomek_i7.driver.features.pipettes import (
+  DEFAULT_TRASH as SPAN8_TRASH,
+)
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.pipettes import Pipettes
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.pod import Pod
 from pylabrobot.beckman_coulter.biomek_i7.driver.master import BiomekI7Driver
-from pylabrobot.beckman_coulter.biomek_i7.driver.simulator import simulated_boards
+from pylabrobot.beckman_coulter.biomek_i7.driver.motors import MotorTables
+from pylabrobot.beckman_coulter.biomek_i7.driver.simulator import (
+  sense_recorded_tips,
+  simulated_boards,
+)
 from pylabrobot.beckman_coulter.biomek_i7.driver import pod_geometry as g
 from pylabrobot.beckman_coulter.biomek_i7.driver.configuration import PodGeometry
 from pylabrobot.beckman_coulter.biomek_i7.resource_model import cm, pod_model
 from pylabrobot.beckman_coulter.biomek_i7.resource_model.pods import HEAD_FLANGE_HEIGHT, HEAD_HEIGHT
+from pylabrobot.resources.beckman_coulter.tips import beckman_coulter_biomek_tip_1070uL
 from pylabrobot.resources.coordinate import Coordinate
 from pylabrobot.resources.resource import Resource
 
@@ -84,6 +95,11 @@ class BiomekI7(Resource):
     deck: Optional[BiomekI7Deck] = None,
     driver: Optional[BiomekI7Driver] = None,
     simulation: bool = False,
+    configuration_json: Optional[str] = None,
+    simulator_recording: Optional[str] = None,
+    state_json: Optional[str] = None,
+    simulate_motion_time: bool = False,
+    motion_time_scale: float = 0.25,
   ):
     """
     Args:
@@ -92,6 +108,19 @@ class BiomekI7(Resource):
       driver: what talks to the instrument.
       simulation: drive a simulated instrument instead (`driver/simulator.py`): powered up, not
         configured, not homed. Ignored when a driver is given.
+      configuration_json: the instrument's declared configuration (its calibration, axis scales
+        and limits, deck positions), for the driver this builds; `$BIOMEK_I7_CONFIGURATION` when
+        None. Ignored when a driver is given.
+      simulator_recording: the cold-start recording a simulated instrument answers identity and
+        sensor reads from; `$BIOMEK_I7_SIMULATOR_RECORDING` when None.
+      state_json: where the driver this builds keeps the tips on each head between sessions
+        (`BiomekI7Driver`'s `state_json`).
+      simulate_motion_time: whether a simulated move takes time at all, as the STAR's and the
+        Prep's simulators take it: the time the instrument's drives would take (from each move's
+        distance, speed and acceleration), so a viewer shows each step. Off, every move answers at
+        once.
+      motion_time_scale: the share of the instrument's time a move takes when it does: a quarter,
+        so a step is watched rather than waited for. 1.0 keeps the instrument's time.
 
     With neither a driver nor `simulation`, the device is a model only, for the visualizer and
     planning, and `setup` raises. (The STAR refuses that; here the model is useful on its own.)
@@ -99,7 +128,18 @@ class BiomekI7(Resource):
     if driver is not None and simulation:
       logger.warning("both a driver and simulation given; driving the driver")
     if driver is None and simulation:
-      driver = BiomekI7Driver(boards=simulated_boards())
+      tables = MotorTables.load(configuration_json)
+      boards = simulated_boards(
+        motor_tables=tables,
+        path=simulator_recording,
+        time_scale=motion_time_scale if simulate_motion_time else 0.0,
+      )
+      driver = BiomekI7Driver(
+        declared_configuration_json=configuration_json, boards=boards, state_json=state_json
+      )
+      sense_recorded_tips(driver, boards)  # the simulator does not model tips
+    elif driver is None and configuration_json is not None:
+      driver = BiomekI7Driver(declared_configuration_json=configuration_json, state_json=state_json)
     self.driver = driver
     super().__init__(
       name=name,
@@ -172,14 +212,21 @@ class BiomekI7(Resource):
     skip_left_pod: bool = False,
     skip_right_pod: bool = False,
     force_initialize: bool = False,
+    discard_tips: bool = True,
+    park: bool = True,
   ) -> None:
-    """Bring the instrument up. This homes the arms.
+    """Bring the instrument up. This homes the arms, then, as the STAR does, takes off any tips
+    left on (`discard_tips`), and parks the pods, as Biomek's Home All does (`park`).
 
     Args:
       skip_device_initialization: as `BiomekI7Driver.setup` takes it.
       skip_left_pod: as `BiomekI7Driver.setup` takes it.
       skip_right_pod: as `BiomekI7Driver.setup` takes it.
       force_initialize: as `BiomekI7Driver.setup` takes it.
+      discard_tips: shuck tips found on a pod that was brought up into its trash: on a Span-8 the
+        probes the tip sensor finds a tip on, on the 96-head the tips the session state records
+        (it has no tip sensor). Needs the trash position on the deck.
+      park: park every pod that was brought up (`park`).
     """
     await self._require_driver().setup(
       skip_device_initialization=skip_device_initialization,
@@ -188,6 +235,48 @@ class BiomekI7(Resource):
       force_initialize=force_initialize,
     )
     self._follow_driver()
+    skipped = {side for side, skip in (("left", skip_left_pod), ("right", skip_right_pod)) if skip}
+    if discard_tips:
+      await self._discard_found_tips(skipped)
+    if park:
+      await self.park(skip=skipped)
+
+  async def _discard_found_tips(self, skipped: Set[str]) -> None:
+    """Shuck the tips found on the pods not `skipped` (`setup`'s `discard_tips`). A Span-8 probe
+    the sensor finds a tip on that the session did not record is taken to carry the longest
+    Biomek tip, so its travel to the trash clears the deck; a recorded tip the sensor does not
+    find is forgotten."""
+    names = set(self.deck.position_names)
+    for pod in self.pods:
+      if pod.side in skipped:
+        continue
+      if pod.pipettes is not None and SPAN8_TRASH in names:
+        pipettes = pod.pipettes
+        states = await pipettes.request_tip_status()
+        found = [n for n, state in enumerate(states, start=1) if state == "loaded"]
+        gone = [n for n, t in enumerate(pipettes.tips, start=1) if t is not None and n not in found]
+        if gone:
+          pipettes._set_tips({n: None for n in gone})
+        if found:
+          assumed = beckman_coulter_biomek_tip_1070uL("assumed tip")
+          pipettes._set_tips({n: pipettes._carried_tip(n) or assumed for n in found})
+          logger.warning("%s: tips found on probes %s; discarding them", pod, found)
+          await pipettes.discard_tips(use_channels=[n - 1 for n in found])
+      if pod.head96 is not None and HEAD96_TRASH in names and any(pod.head96.tips):
+        logger.warning("%s: the 96-head carries tips, as recorded; discarding them", pod)
+        await pod.head96.discard_tips()
+
+  async def park(self, skip: Iterable[str] = ()) -> None:
+    """Park the pods as Biomek does (`Pod.park`; a Span-8 over its wash station,
+    `pipettes.park`), the left pod first, as each pod's park is at its own end of the rail. `skip`:
+    sides to leave as they are."""
+    for pod in sorted(self._require_driver().pods, key=lambda p: p.side != "left"):
+      if pod.side in skip:
+        continue
+      if pod.pipettes is not None:
+        await pod.pipettes.park()
+      else:
+        await pod.park()
 
   async def home_all(self, force: bool = True) -> None:
     """Biomek's Home All: bring the instrument up again, by default homing every axis as Biomek
