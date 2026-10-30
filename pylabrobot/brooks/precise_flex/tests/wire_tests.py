@@ -11,9 +11,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Type
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pylabrobot.brooks.precise_flex import (
-  Axis,
   PreciseFlex,
   PreciseFlexArm,
+  PreciseFlexAxis,
   PreciseFlexCartesianPose,
   PreciseFlexDriver,
   PreciseFlexGripper,
@@ -169,13 +169,14 @@ def _is_number(token: str) -> bool:
 
 
 _J = {
-  Axis.BASE: 200.0,
-  Axis.SHOULDER: 10.0,
-  Axis.ELBOW: 170.0,
-  Axis.WRIST: 20.0,
-  Axis.GRIPPER: 100.0,
+  PreciseFlexAxis.BASE: 200.0,
+  PreciseFlexAxis.SHOULDER: 10.0,
+  PreciseFlexAxis.ELBOW: 170.0,
+  PreciseFlexAxis.WRIST: 20.0,
+  PreciseFlexAxis.GRIPPER: 100.0,
 }
-_JR = {**_J, Axis.RAIL: 500.0}
+_JR = {**_J, PreciseFlexAxis.RAIL: 500.0}
+# The tool point: the v23's fingers grip 51.25 mm below the flange plane, so Z stands that higher.
 _LOC = Coordinate(x=400.0, y=100.0, z=150.0)
 _POSES = [
   PreciseFlexCartesianPose(location=Coordinate(400.0, 100.0, 150.0), rotation=Rotation(z=0)),
@@ -370,7 +371,7 @@ _CASES: List[_Case] = [
   ),
   (
     "set_axis_parameter",
-    lambda arm: arm.set_axis_parameter(2700, Axis.SHOULDER, 300),
+    lambda arm: arm.set_axis_parameter(2700, PreciseFlexAxis.SHOULDER, 300),
     [
       "pc 2700 1 0 2 300",
     ],
@@ -934,6 +935,10 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "moveJ 1 200.0 10.0 170.0 20.0 100.0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -947,6 +952,10 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "moveJ 1 200.0 10.0 170.0 20.0 100.0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -969,11 +978,11 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
+      "moveJ 1 201.25 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
       "wherej",
       "wherej",
       "wherej",
       "wherej",
-      "moveJ 1 150.0 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
     ],
     None,
   ),
@@ -986,11 +995,11 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
+      "moveJ 1 201.25 -57.13213751792647 127.7714622309491 -40.63932471302264 70.685",
       "wherej",
       "wherej",
       "wherej",
       "wherej",
-      "moveJ 1 150.0 -57.13213751792647 127.7714622309491 -40.63932471302264 70.685",
     ],
     None,
   ),
@@ -1004,8 +1013,9 @@ _CASES: List[_Case] = [
       "wherej",
       "Profile 1",
       "Profile 1 50.0 0.0 100.0 100.0 0.1 0.1 -1 0",
-      "moveJ 1 150.0 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
-      "moveJ 1 160.0 -49.554898023417685 126.64906635048342 -67.09416832706574 70.685",
+      "moveJ 1 201.25 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
+      "moveJ 1 211.25 -49.554898023417685 126.64906635048342 -67.09416832706574 70.685",
+      "wherej",
       "wherej",
       "wherej",
       "wherej",
@@ -1022,8 +1032,9 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
-      "moveJ 1 150.0 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
-      "moveJ 1 160.0 -49.554898023417685 126.64906635048342 -67.09416832706574 70.685",
+      "moveJ 1 201.25 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
+      "moveJ 1 211.25 -49.554898023417685 126.64906635048342 -67.09416832706574 70.685",
+      "wherej",
       "wherej",
       "wherej",
       "wherej",
@@ -1069,8 +1080,13 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
+      "wherej",
       "GripOpenPos 130.0",
       "gripper 1",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1081,8 +1097,13 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
+      "wherej",
       "GripClosePos 70.0",
       "gripper 2",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1093,8 +1114,13 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
+      "wherej",
       "GripOpenPos 120.0",
       "gripper 1",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1105,8 +1131,13 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
+      "wherej",
       "GripClosePos 70.0",
       "gripper 2",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1129,9 +1160,17 @@ _CASES: List[_Case] = [
     lambda arm: arm.arm.pick_up_at_joint_state(_J, resource_width=85.0),
     [
       "GraspData 85.0 50.0 10.0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
       "locAngles 1 200.0 10.0 170.0 20.0 100.0",
       "StationType 1 1 0 100 0 10",
       "pickplate 1 0 0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1139,9 +1178,17 @@ _CASES: List[_Case] = [
     "drop_at_joint_position",
     lambda arm: arm.arm.drop_at_joint_state(_J, resource_width=85.0),
     [
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
       "locAngles 1 200.0 10.0 170.0 20.0 100.0",
       "StationType 1 1 0 100 0 10",
       "placeplate 1 0 0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1154,9 +1201,13 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
-      "locAngles 1 150.0 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
+      "locAngles 1 201.25 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
       "StationType 1 1 0 100 0 10",
       "pickplate 1 0 0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1168,9 +1219,13 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
-      "locAngles 1 150.0 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
+      "locAngles 1 201.25 -38.74046014630248 128.25603427878514 -89.51557413248264 70.685",
       "StationType 1 1 0 100 0 10",
       "placeplate 1 0 0",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1183,6 +1238,10 @@ _CASES: List[_Case] = [
       "wherej",
       "wherej",
       "moveJ 1 301.125 0.0 180.0 180.0 70.685",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1240,6 +1299,10 @@ _RAIL_CASES: List[_Case] = [
       "wherej",
       "wherej",
       "moveJ 1 200.0 10.0 170.0 20.0 100.0 500.0 ",
+      "wherej",
+      "wherej",
+      "wherej",
+      "wherej",
     ],
     None,
   ),
@@ -1252,10 +1315,6 @@ _RAIL_CASES: List[_Case] = [
       "wherej",
       "Rail 1 300.0",
       "MoveRail 1 1",
-      "wherej",
-      "wherej",
-      "wherej",
-      "wherej",
       "wherej",
       "wherej",
       "wherej",
@@ -1287,6 +1346,7 @@ _RAIL_CASES: List[_Case] = [
     None,
   ),
   (
+    # The station is past the shoulder's soft limit: refused before anything is sent.
     "rail_pick_up_at_location",
     lambda arm: arm.arm.pick_up_at_location(
       _LOC, direction=0.0, resource_width=85.0, rail_position=300.0
@@ -1302,11 +1362,8 @@ _RAIL_CASES: List[_Case] = [
       "wherej",
       "wherej",
       "wherej",
-      "locAngles 1 500.0 150.0 99.75007617280966 123.39657317069872 -223.14664934350833 70.685",
-      "StationType 1 1 0 100 0 10",
-      "pickplate 1 0 0",
     ],
-    None,
+    ValueError,
   ),
 ]
 
@@ -1513,7 +1570,7 @@ class TestPreciseFlexWire(unittest.IsolatedAsyncioTestCase):
         for name in ("max_joint_speed", "max_joint_acceleration", "max_joint_deceleration"):
           with self.subTest(name), self.assertWarns(DeprecationWarning):
             self.assertEqual(
-              set(getattr(config, name)) - set(config.arm.soft_limits), {Axis.GRIPPER}
+              set(getattr(config, name)) - set(config.arm.soft_limits), {PreciseFlexAxis.GRIPPER}
             )
         self.assertEqual(config.has_rail, has_rail)
 
@@ -1574,7 +1631,7 @@ class TestPreciseFlexWire(unittest.IsolatedAsyncioTestCase):
     await arm.setup()
     fake.sent.clear()
     fake._replies["wherej"] = "0 301.02 93.476 179.609 83.93 125.867"
-    self.assertEqual(await arm.arm.recover_axes_within_limits(), {Axis.SHOULDER: 92.0})
+    self.assertEqual(await arm.arm.recover_axes_within_limits(), {PreciseFlexAxis.SHOULDER: 92.0})
     self.assert_wire(
       fake.sent,
       [
@@ -1584,7 +1641,13 @@ class TestPreciseFlexWire(unittest.IsolatedAsyncioTestCase):
         "wherej",
         "Speed 1",
         "Speed 1 20.0",
+        # Each axis is moved from where it was just read.
+        "wherej",
+        "wherej",
+        "wherej",
+        "wherej",
         "MoveOneAxis 2 92.0 1",
+        "wherej",
         "wherej",
         "wherej",
         "wherej",
@@ -2140,7 +2203,7 @@ class TestDeprecatedDriverMembers(unittest.IsolatedAsyncioTestCase):
       ("location_index", "station_index", 3),
       ("horizontal_compliance", "horizontal_compliance", True),
       ("horizontal_compliance_torque", "horizontal_compliance_torque", 20),
-      ("parking_position", "parking_position", {Axis.SHOULDER: 0.0}),
+      ("parking_position", "parking_position", {PreciseFlexAxis.SHOULDER: 0.0}),
     ):
       with self.subTest(name):
         with self.assertWarns(DeprecationWarning):
@@ -2197,6 +2260,14 @@ class TestDeprecatedDriverMembers(unittest.IsolatedAsyncioTestCase):
 
     with self.assertWarns(DeprecationWarning):
       self.assertIs(kinematics.JointPose, kinematics.JointState)
+
+  def test_axis(self):
+    from pylabrobot.brooks import precise_flex
+    from pylabrobot.brooks.precise_flex import kinematics
+
+    for module in (precise_flex, kinematics):
+      with self.subTest(module.__name__), self.assertWarns(DeprecationWarning):
+        self.assertIs(module.Axis, kinematics.PreciseFlexAxis)
 
 
 if __name__ == "__main__":

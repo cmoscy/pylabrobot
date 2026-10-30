@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import (
   TYPE_CHECKING,
+  Any,
   Dict,
   List,
   Literal,
@@ -42,6 +43,7 @@ from .measurement import (
   MeasurementConfiguration,
   MeasurementSettings,
   ShakeSettings,
+  _enforce_one_measurement_at_a_time,
   _get_measured_identifiers,
 )
 
@@ -69,10 +71,24 @@ class CLARIOstarFluorescenceResult(FluorescenceResult):
     matrix_points: a matrix scan's counts, every measured point of each well in the order the
       reader sends them, keyed as ``data``; None for any other well scan. ``data`` then holds
       the plain mean of each well's points.
+    focal_height: mm above the plate's base; None if not known.
+    optic_position: the optic read from, "top" or "bottom"; None if not known.
   """
 
   gain: int
   matrix_points: Optional[Dict[str, List[float]]] = None
+  focal_height: Optional[float] = None
+  optic_position: Optional[OpticPosition] = None
+
+  def _get_base_row(self, read: int, **columns: Any) -> Dict[str, Any]:
+    """The columns every row shares, with the gain, focal height and optic position."""
+    return super()._get_base_row(
+      read,
+      gain=self.gain,
+      focal_height=self.focal_height,
+      optic_position=self.optic_position,
+      **columns,
+    )
 
 
 @dataclass(frozen=True)
@@ -147,6 +163,10 @@ class CLARIOstarFluorescenceSpectrumResult(FluorescenceSpectrumResult):
   """
 
   gain: int
+
+  def _get_base_row(self, read: int, **columns: Any) -> Dict[str, Any]:
+    """The columns every row shares, with the gain."""
+    return super()._get_base_row(read, gain=self.gain, **columns)
 
 
 @dataclass
@@ -846,9 +866,7 @@ class Fluorescence(Measurement):
     )
     return f"{excitation} -> {emission}" + ("" if gain is None else f", gain {gain}")
 
-  def _get_result_optics(
-    self, fluorescence_channel: FluorescenceChannel
-  ) -> Dict[str, Optional[float]]:
+  def _get_result_optics(self, fluorescence_channel: FluorescenceChannel) -> Dict[str, Any]:
     """A fluorescence channel's optics as a result's keyword arguments.
 
     Excitation's and emission's filter passband, or monochromator wavelength and the bandwidth the
@@ -856,7 +874,7 @@ class Fluorescence(Measurement):
     """
     excitation_filter = self._get_resolved_filter(fluorescence_channel.excitation_filter)
     emission_filter = self._get_resolved_filter(fluorescence_channel.emission_filter)
-    optics: Dict[str, Optional[float]] = {}
+    optics: Dict[str, Any] = {}
     if excitation_filter is not None:
       optics["excitation_wavelength"] = excitation_filter.center_wavelength
       optics["excitation_bandwidth"] = excitation_filter.bandwidth
@@ -1243,6 +1261,7 @@ class Fluorescence(Measurement):
 
   # -- measuring -----------------------------------------------------------------------------------
 
+  @_enforce_one_measurement_at_a_time
   async def _run_z_profile(self, parameters: bytes, timeout: float) -> bytes:
     """Send a z-scan (`09`) and return its FOCUS_RESULT reply.
 
@@ -1252,10 +1271,14 @@ class Fluorescence(Measurement):
 
     Raises:
       TimeoutError: if the z-scan takes longer than `timeout` seconds.
-      RuntimeError: if it ends without reporting its result ready.
+      RuntimeError: if the drawer is open (nothing is sent), or the z-scan ends without reporting
+        its result ready.
     """
     driver = self._driver
-    await driver.send_command(driver.CommandFamily.FOCUS_WELL, parameters=parameters)
+    await self._wait_until_idle_with_drawer_in()
+    await driver.send_command(
+      driver.CommandFamily.FOCUS_WELL, parameters=parameters, when_idle=False
+    )
     start = time.monotonic()
     stage: Optional[int] = None
     try:
@@ -1313,7 +1336,8 @@ class Fluorescence(Measurement):
       the z-profile, its peak, and the gain with a target.
 
     Raises:
-      RuntimeError: if no plate is in the plate holder, or the z-scan ends without a result.
+      RuntimeError: if no plate is in the plate holder, the drawer is open, or the z-scan ends
+        without a result.
       ValueError: if an argument is out of range (`_check_z_profile_arguments`, `_get_filter`),
         the well is not on the plate, or the reply is not a z-profile.
       TimeoutError: if the z-scan takes longer than `timeout` seconds.
@@ -1481,6 +1505,7 @@ class Fluorescence(Measurement):
 
   # -- measuring -----------------------------------------------------------------------------------
 
+  @_enforce_one_measurement_at_a_time
   async def _run_grid(
     self, parameters: bytes, timeout: float
   ) -> Tuple[int, float, List[bytes], bytes]:
@@ -1495,9 +1520,13 @@ class Fluorescence(Measurement):
 
     Raises:
       TimeoutError: if the scan takes longer than `timeout` seconds.
+      RuntimeError: if the drawer is open; nothing is sent.
     """
     driver = self._driver
-    await driver.send_command(driver.CommandFamily.PLATE_MAP_SCAN, parameters=parameters)
+    await self._wait_until_idle_with_drawer_in()
+    await driver.send_command(
+      driver.CommandFamily.PLATE_MAP_SCAN, parameters=parameters, when_idle=False
+    )
     start = time.monotonic()
     grids: List[bytes] = []
     try:
@@ -1605,7 +1634,7 @@ class Fluorescence(Measurement):
     Raises:
       ValueError: if an argument is out of range, or a reply is not what the scan sends.
       TimeoutError: if the scan takes longer than `timeout` seconds.
-      RuntimeError: if the scan returns another number of grids than points.
+      RuntimeError: if the drawer is open, or the scan returns another number of grids than points.
     """
     filled = self._get_filled_fluorescence_channel(fluorescence_channel)
     optic = self.default_optic_position if optic_position is None else optic_position
@@ -1662,8 +1691,8 @@ class Fluorescence(Measurement):
       a grid for each well, in order, its centre and `center` relative to the plate.
 
     Raises:
-      RuntimeError: if no plate is in the plate holder, the z-scan fits no gain, or a scan returns
-        another number of grids than wells.
+      RuntimeError: if no plate is in the plate holder, the drawer is open, the z-scan fits no gain,
+        or a scan returns another number of grids than wells.
       ValueError: if an argument is out of range, a well is not on the plate, or a reply is not
         what the scan sends.
       TimeoutError: if a scan takes longer than `timeout` seconds.
@@ -1854,6 +1883,8 @@ class Fluorescence(Measurement):
     temperature: Optional[float],
     start_timestamp: datetime,
     end_timestamp: datetime,
+    focal_height: Optional[float] = None,
+    optic_position: Optional[OpticPosition] = None,
   ) -> List[CLARIOstarFluorescenceResult]:
     """One result per fluorescence channel: each well's mean, and with `matrix` its points."""
     results = []
@@ -1873,6 +1904,8 @@ class Fluorescence(Measurement):
           start_timestamp=start_timestamp,
           end_timestamp=end_timestamp,
           matrix_points=points if matrix else None,
+          focal_height=focal_height,
+          optic_position=optic_position,
         )
       )
     return results
@@ -1967,7 +2000,9 @@ class Fluorescence(Measurement):
     enhanced_dynamic_range: bool = ...,
     measurement_settings: Optional[MeasurementSettings] = ...,
     shake_settings: Optional[ShakeSettings] = ...,
+    simulated_data: Optional[Sequence[FluorescenceResult]] = ...,
     timeout: Optional[float] = ...,
+    results_directory: Optional[str] = ...,
   ) -> CLARIOstarFluorescenceResult: ...
 
   @overload
@@ -1983,7 +2018,9 @@ class Fluorescence(Measurement):
     enhanced_dynamic_range: bool = ...,
     measurement_settings: Optional[MeasurementSettings] = ...,
     shake_settings: Optional[ShakeSettings] = ...,
+    simulated_data: Optional[Sequence[FluorescenceResult]] = ...,
     timeout: Optional[float] = ...,
+    results_directory: Optional[str] = ...,
   ) -> List[CLARIOstarFluorescenceResult]: ...
 
   async def measure(
@@ -1998,7 +2035,9 @@ class Fluorescence(Measurement):
     enhanced_dynamic_range: bool = False,
     measurement_settings: Optional[MeasurementSettings] = None,
     shake_settings: Optional[ShakeSettings] = None,
+    simulated_data: Optional[Sequence[FluorescenceResult]] = None,
     timeout: Optional[float] = None,
+    results_directory: Optional[str] = None,
   ) -> Union[CLARIOstarFluorescenceResult, List[CLARIOstarFluorescenceResult]]:
     """Measure the plate through one fluorescence channel, or several in one pass.
 
@@ -2027,17 +2066,24 @@ class Fluorescence(Measurement):
         than a normal read's and not comparable with them.
       measurement_settings: how to read, without a pause; None reads with the defaults.
       shake_settings: shake the plate before the read; None does not shake.
+      simulated_data: what each measured well reads on the simulated reader (`simulator`); a
+        real reader measures the plate and ignores it, so one call serves both.
       timeout: seconds the run may take; `default_read_timeout` when None.
+      results_directory: the directory the read's rows are appended to once it is complete
+        (`pylabrobot.lib.results.directory`); None writes none.
 
     Returns:
-      the counts of the measured wells, with the optics and the gain they were read with; for a
-      sequence of fluorescence channels, one result per fluorescence channel in the order given.
+      the counts of the measured wells, with the optics, gain, focal height and optic position they
+      were read with; for a sequence of fluorescence channels, one result per fluorescence channel
+      in the order given.
 
     Raises:
-      RuntimeError: if no plate is in the plate holder, or the run ends without its data.
+      RuntimeError: if no plate is in the plate holder, the drawer is open, the run ends without its
+        data, or the last write to the results directory failed.
       ValueError: if an argument is out of range (`_check_arguments`), a filter's slot or name has
         no slide or is not on it (`_get_filter`), a matrix scan has several wells, the settings
-        cannot read the wells of the plate, or the reply is not this read's (`_decode_data_reply`).
+        cannot read the wells of the plate, the reply is not this read's (`_decode_data_reply`),
+        or the results directory cannot be created or written.
       TimeoutError: if the run takes longer than `timeout` seconds.
     """
     measurement = MeasurementSettings() if measurement_settings is None else measurement_settings
@@ -2057,6 +2103,8 @@ class Fluorescence(Measurement):
       enhanced_dynamic_range=enhanced_dynamic_range,
     )
     timeout = self.default_read_timeout if timeout is None else timeout
+    if focal_height is None:
+      focal_height = self._get_default_focal_height(wells)
     logger.info(
       "fluorescence: %s, %d of %d wells of %s, %s scan, %s optic",
       "; ".join(
@@ -2069,6 +2117,7 @@ class Fluorescence(Measurement):
       measurement.well_scan,
       optic_position,
     )
+    results_directory = self._check_results_directory(results_directory)
     start_timestamp = datetime.now()
     replies, end_timestamp = await self._run_measurement(parameters, timeout)
     identifiers = _get_measured_identifiers(plate, wells)
@@ -2089,7 +2138,10 @@ class Fluorescence(Measurement):
       temperature=temperature,
       start_timestamp=start_timestamp,
       end_timestamp=end_timestamp,
+      focal_height=focal_height,
+      optic_position=optic_position,
     )
+    await self._append_results(results_directory, results)
     return results[0] if isinstance(fluorescence_channels, FluorescenceChannel) else results
 
   # ----------------------------------------
@@ -2271,6 +2323,7 @@ class Fluorescence(Measurement):
     measurement_settings: Optional[MeasurementSettings] = None,
     shake_settings: Optional[ShakeSettings] = None,
     timeout: Optional[float] = None,
+    results_directory: Optional[str] = None,
   ) -> CLARIOstarFluorescenceSpectrumResult:
     """Measure a fluorescence spectrum: excitation or emission scanned, the other fixed.
 
@@ -2302,15 +2355,19 @@ class Fluorescence(Measurement):
       shake_settings: shake the plate before the read; None does not shake.
       timeout: seconds the run may take; `default_read_timeout` when None, too short for a full
         plate of a long spectrum (14 s per well at 221 wavelengths).
+      results_directory: the directory the read's rows are appended to once it is complete
+        (`pylabrobot.lib.results.directory`); None writes none.
 
     Returns:
       each measured well's counts by the scanned wavelength, with the fixed one's optics and the
       gain.
 
     Raises:
-      RuntimeError: if no plate is in the plate holder, or the run ends without all its data.
+      RuntimeError: if no plate is in the plate holder, the drawer is open, the run ends without all
+        its data, or the last write to the results directory failed.
       ValueError: if an argument is out of range (`_check_spectrum_arguments`), the settings
-        cannot read the wells of the plate, or the data pages are not this read's.
+        cannot read the wells of the plate, the data pages are not this read's, or the results
+        directory cannot be created or written.
       TimeoutError: if the run takes longer than `timeout` seconds.
       FrameError: if a data page arrives short on the second read too.
     """
@@ -2373,6 +2430,7 @@ class Fluorescence(Measurement):
       plate.name,
       measurement.well_scan,
     )
+    results_directory = self._check_results_directory(results_directory)
     try:
       start_timestamp = datetime.now()
       pages, end_timestamp = await self._run_measurement(
@@ -2390,7 +2448,7 @@ class Fluorescence(Measurement):
     self._warn_saturated(
       "fluorescence", [value for spectrum in spectra.values() for value in spectrum], ceiling
     )
-    return self._get_spectrum_result(
+    result = self._get_spectrum_result(
       fixed,
       gain,
       wavelengths,
@@ -2399,3 +2457,5 @@ class Fluorescence(Measurement):
       start_timestamp=start_timestamp,
       end_timestamp=end_timestamp,
     )
+    await self._append_results(results_directory, [result])
+    return result
