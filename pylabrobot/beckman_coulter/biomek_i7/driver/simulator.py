@@ -13,11 +13,12 @@ ignored it would, and is kept in `unanswered`.
 import asyncio
 import gzip
 import json
+import math
 import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from pylabrobot.beckman_coulter.biomek_i7.driver.board import AceBoard
 from pylabrobot.beckman_coulter.biomek_i7.driver.framing import frame, split
@@ -28,6 +29,9 @@ from pylabrobot.beckman_coulter.biomek_i7.driver.protocol import (
   Device,
 )
 from pylabrobot.io.usb import USB
+
+if TYPE_CHECKING:
+  from pylabrobot.beckman_coulter.biomek_i7.driver.master import BiomekI7Driver
 
 # Names the recording the simulator answers from (identity and sensor reads, recorded at an
 # instrument's cold start) when no path is given; none ships with the driver.
@@ -107,7 +111,10 @@ def replay_boards(
 # Axes a Home of one axis also homes. Biomek homes only Y1 of the Span-8's eight Y channels, and
 # after its Home All every one of them reads as homed (H1, 2026-10-24).
 LINKED_HOMES: Dict[str, Dict[str, Tuple[str, ...]]] = {
-  "span8": {"Y1": tuple(f"Y{i}" for i in range(1, 9))},
+  "span8": {
+    "Y1": tuple(f"Y{i}" for i in range(1, 9)),
+    "D1": tuple(f"D{i}" for i in range(1, 9)),  # the pumps (`HD`, 2026-10-09)
+  },
 }
 
 
@@ -137,7 +144,13 @@ class SimulatedAceUSB(ReplayAceUSB):
   plate). A move with a sensor stops where the sensor fires (`_AxisModel.sensed_at`), and the
   Move All carries that axis's report (LLS_LIQUID_SENSED and the position) under its sequence.
   A pump keeps the valve it was last
-  moved through. Get Tip Status answers `tip_states` when set, else from the recording.
+  moved through. Get Tip Status answers `tip_states` when set, else `tip_sensor()` when set (the
+  simulator does not model tips; `sense_recorded_tips` has it report the session's), else from the
+  recording.
+
+  Moves complete at once unless `time_scale` is set: then a Move or Move All is accepted at once
+  and done after the slowest axis's move would take (`_AxisModel.duration`), times `time_scale`
+  (1: about as long as on the instrument), so a simulated run can be watched and stopped.
   """
 
   def __init__(
@@ -151,8 +164,11 @@ class SimulatedAceUSB(ReplayAceUSB):
     interlock: Optional["Interlock"] = None,
     supply_input: Optional[int] = None,
     door_input: Optional[int] = None,
+    time_scale: float = 0.0,
   ):
     super().__init__(recording, name=name)
+    self.time_scale = time_scale
+    self._move_seconds = 0.0  # how long the move just answered takes (`answer`)
     self.door_input = door_input
     homed = set(homed)
     if homed and not configured:
@@ -170,6 +186,7 @@ class SimulatedAceUSB(ReplayAceUSB):
     # Get Tip Status's answer, one byte per probe (0 loaded, 1 cannot tell, 2 unloaded); None
     # answers from the recording.
     self.tip_states: Optional[bytes] = None
+    self.tip_sensor: Optional[Callable[[], bytes]] = None
 
   def _apply_power(self) -> None:
     """An enabled CiA 402 drive faults when its motor power goes. One configured with the power
@@ -244,11 +261,17 @@ class SimulatedAceUSB(ReplayAceUSB):
         if device == Device.PUMP:
           axis.valve = params[20]
           axis.force = axis.sensor = 0
+          axis.velocity, axis.acceleration = (
+            struct.unpack_from("<II", params, 4)[0],
+            struct.unpack_from("<I", params, 12)[0],
+          )
         else:
+          axis.velocity, axis.acceleration = struct.unpack_from("<II", params, 0)
           axis.force = struct.unpack_from("<I", params, 12)[0]
           axis.sensor = params[20]
         return [done]
       if opcode == 0x50:
+        self._move_seconds = axis.duration()
         axis.finish_move()
         return [accepted, done]
       if opcode == 0x51:
@@ -266,6 +289,7 @@ class SimulatedAceUSB(ReplayAceUSB):
       if not self.interlock.armed:
         return [tripped]
       reports = []
+      self._move_seconds = max((m.duration() for m in self.axes.values()), default=0.0)
       for (axis_device, axis_index), model in self.axes.items():
         if model.finish_move() == "sensed":
           reports.append(
@@ -275,6 +299,10 @@ class SimulatedAceUSB(ReplayAceUSB):
       return [accepted, *reports, done]
     if device == Device.TIP_SENSOR and opcode == 0x10 and self.tip_states is not None:
       return [done + self.tip_states]
+    if device == Device.TIP_SENSOR and opcode == 0x10 and self.tip_sensor is not None:
+      return [done + self.tip_sensor()]
+    if device == Device.TIP_SENSOR and opcode == 0x41:  # LLS/CD sensitivity: done, as logged
+      return [done]
     if device == Device.MODULE and opcode == 0x0F:
       return [done]
     if device == Device.INTERLOCK and opcode == 0x10:
@@ -299,13 +327,23 @@ class SimulatedAceUSB(ReplayAceUSB):
 
   async def write(self, data: bytes, timeout: Optional[float] = None):
     for message in split(data):
+      self._move_seconds = 0.0
       replies = self.answer(message)
       if replies is None:
         await super().write(frame(message), timeout)
         continue
       self.requests.append(message)
-      for reply in replies:
-        self._queue(reply)
+      delay = self._move_seconds * self.time_scale
+      if delay > 0 and len(replies) > 1:
+        # Accepted now; the rest (reports, done) once the move would have finished.
+        self._queue(replies[0])
+        asyncio.get_running_loop().call_later(delay, self._queue_all, replies[1:])
+        continue
+      self._queue_all(replies)
+
+  def _queue_all(self, replies: List[bytes]) -> None:
+    for reply in replies:
+      self._queue(reply)
 
   def _queue(self, message: bytes) -> None:
     framed = frame(message)
@@ -342,6 +380,20 @@ class _AxisModel:
   # The control effort the axis reads at rest, and while stalled against an obstacle.
   effort: int = 0
   stalled_effort: int = -1000
+  # The pending move's top speed (counts/s) and acceleration (counts/s2), as last set.
+  velocity: int = 0
+  acceleration: int = 0
+
+  def duration(self) -> float:
+    """Seconds the pending move takes: up to speed, at speed, down again (jerk left out); 0
+    with none, or without speeds."""
+    if self.pending is None or self.velocity <= 0 or self.acceleration <= 0:
+      return 0.0
+    distance = abs(self.pending - self.position)
+    v, a = float(self.velocity), float(self.acceleration)
+    if distance >= v * v / a:
+      return distance / v + v / a
+    return 2.0 * math.sqrt(distance / a)
 
   def finish_move(self) -> Optional[str]:
     """Run the pending move to its end: its target, or where force or a sensor stops it. Returns
@@ -378,6 +430,7 @@ def simulated_boards(
   path: Optional[Union[str, Path]] = None,
   default_timeout: float = 1.0,
   configured: Optional[Union[bool, Dict[str, bool]]] = None,
+  time_scale: float = 0.0,
 ) -> List[AceBoard]:
   """A simulated instrument as `BiomekI7Driver(boards=...)` takes it: the recorded chassis, a left
   Multichannel and a right Span-8 pod.
@@ -390,6 +443,7 @@ def simulated_boards(
     configured: whether each arm's board has its motor tables, as one value or per arm type.
       Defaults to configured wherever an axis is homed, and not configured (just powered up)
       otherwise.
+    time_scale: how long moves take, as `SimulatedAceUSB` takes it (0: at once).
   """
   tables = motor_tables or MotorTables.load()
   with gzip.open(recording_path(path), "rt", encoding="utf-8") as fh:
@@ -419,6 +473,25 @@ def simulated_boards(
       interlock=interlock,
       supply_input=SUPPLY_INPUTS.get(module),
       door_input=DOOR_INPUTS.get(module),
+      time_scale=time_scale,
     )
     boards.append(AceBoard(io=usb, name=f"simulated {module}", default_timeout=default_timeout))
   return boards
+
+
+def sense_recorded_tips(driver: "BiomekI7Driver", boards: Sequence[AceBoard]) -> None:
+  """Have each simulated Span-8 board's tip sensor report the tips the driver's session records
+  for its pod (0 loaded, 2 unloaded per probe), so a simulated run's tip checks pass where the
+  pickups and discards it ran would leave tips. `boards`: the driver's simulated boards."""
+  for board in boards:
+    io = board.io
+    if not isinstance(io, SimulatedAceUSB) or board.name != "simulated span8":
+      continue
+
+    def sense() -> bytes:
+      pod = next((p for p in driver.pods if p.module_type == "span8"), None)
+      tips = list(driver.state.pod(pod.side).tips) if pod is not None else []
+      tips += [None] * (8 - len(tips))
+      return bytes(0x00 if t is not None else 0x02 for t in tips[:8])
+
+    io.tip_sensor = sense

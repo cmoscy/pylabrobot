@@ -26,18 +26,24 @@ A carried tip's end is the head's Z less the tip's effective length, `TipHeight`
 the tip class's, so the `Tip`'s `fitting_depth`, the Span-8's, is not used here).
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from pylabrobot.beckman_coulter.biomek_i7 import targeting
+from pylabrobot.beckman_coulter.biomek_i7.driver.features import liquid
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.homing import PLUNGER_RECIPES, Homer
 from pylabrobot.beckman_coulter.biomek_i7.driver.features.tip_load import TipLoad, load_tips
-from pylabrobot.beckman_coulter.biomek_i7.resource_model.labware import biomek_tip
+from pylabrobot.beckman_coulter.biomek_i7.resource_model.alps import BiomekPosition
+from pylabrobot.beckman_coulter.biomek_i7.techniques import Conditioning, TipTouch
+from pylabrobot.resources.container import Container
 from pylabrobot.resources.coordinate import Coordinate
+from pylabrobot.resources.plate import Plate
 from pylabrobot.resources.resource import Resource
 from pylabrobot.resources.tip import Tip
 from pylabrobot.resources.tip_rack import TipRack, TipSpot
+from pylabrobot.resources.volume_tracker import VolumeTracker, does_volume_tracking
 
 if TYPE_CHECKING:
   from pylabrobot.beckman_coulter.biomek_i7.deck import BiomekI7Deck
@@ -50,6 +56,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ROWS, COLUMNS = 8, 12
+# uL: how far a plunger read back from counts may sit below what it was sent to (a count is
+# 0.0043 uL on this head).
+PLUNGER_TOLERANCE = 0.01
 DEFAULT_TRASH = "TR1"
 
 
@@ -81,8 +90,26 @@ class HeadPlan:
   pairs: Tuple[Tuple[str, TipSpot], ...] = ()
 
 
+@dataclass(frozen=True)
+class LiquidPlan:
+  """An aspirate or dispense: mandrel A1's X/Y over the well(s) in Biomek's frame (cm), the
+  channels, the template's moves (`features/liquid.py`) and which mandrel works which container."""
+
+  x: float
+  y: float
+  channels: Tuple[liquid.Channel, ...]
+  steps: Tuple[liquid.Step, ...]
+  pairs: Tuple[Tuple[str, Container], ...]
+
+
 class Head96:
   """The 96-channel head of a Multichannel pod."""
+
+  # Where neither the caller nor a technique gives a value (STAR P6): the tips' ends 1 mm above
+  # the bottom, Biomek's Water liquid type's 90 uL/s, the Z speed of its MC techniques.
+  default_liquid_height = 1.0
+  default_flow_rate = 90.0
+  default_z_speed = 20.0
 
   def __init__(self, pod: "Pod"):
     self._pod = pod
@@ -116,7 +143,7 @@ class Head96:
 
   @property
   def tips(self) -> List[Optional[str]]:
-    """Each mandrel's tip (its model), A1..H12 row by row; None for none. Kept in the session state:
+    """Each mandrel's tip (its model, else name: `state.tip_key`), A1..H12 row by row; None for none. Kept in the session state:
     the head cannot sense tips."""
     driver = self._pod.driver
     if driver is None:
@@ -124,18 +151,27 @@ class Head96:
     tips = driver.state.pod(self._pod.side).tips
     return list(tips) + [None] * (ROWS * COLUMNS - len(tips))
 
-  def _set_tips(self, mandrels: Dict[str, Optional[str]]) -> None:
+  def _set_tips(self, mandrels: Mapping[str, Optional[Tip]]) -> None:
+    """Record the tip each of `mandrels` carries (None: none) in the session state."""
     driver = self._pod.driver
     if driver is None:
       return
     state = driver.state.pod(self._pod.side)
-    tips = self.tips
-    for name, model in mandrels.items():
+    state.tips = self.tips
+    for name, tip in mandrels.items():
       row, column = mandrel_index(name)
-      tips[row * COLUMNS + column] = model
-    state.tips = tips
+      state.set_tip(row * COLUMNS + column, tip)
     if driver.state_json:
       driver.save_state()
+
+  def _carried_tip(self, mandrel: str) -> Optional[Tip]:
+    """The tip on `mandrel`: the one picked up this session, else as the session state defines it."""
+    tip = self._tips.get(mandrel)
+    driver = self._pod.driver
+    if tip is None and driver is not None:
+      row, column = mandrel_index(mandrel)
+      tip = driver.state.pod(self._pod.side).tip(row * COLUMNS + column)
+    return tip
 
   def _context(self) -> Tuple["BiomekI7Deck", "DeviceConfiguration", "PodConfiguration"]:
     driver, declared = self._pod.driver, self._pod.declared
@@ -190,9 +226,17 @@ class Head96:
     """Where a pickup goes, and the `LT` it sends. Only spots holding a tip (when tracked) count.
 
     Raises:
-      ValueError: if no mandrel would meet a tip.
+      ValueError: if no mandrel would meet a tip, or the rack is on a deck position that does not
+        take a 96-head tip load (Biomek's "Multichannel Can Load Tips": only the tip-loading
+        ALP's positions; elsewhere the press is not meant to land).
     """
-    _, _, declared = self._context()
+    deck, _, declared = self._context()
+    position = targeting.deck_position_of(deck, tip_rack)
+    if isinstance(position, BiomekPosition) and not position.head96_tip_loading:
+      raise ValueError(
+        f"{self}: {position.name} is not a tip-loading position; the 96-head loads tips only on a "
+        "tip-loading ALP (TipLoad1x1)"
+      )
     pairs = tuple(
       (m, s) for m, s in self._pairs(tip_rack, channel, tip_spot) if not s.tracks_tips or s.tip
     )
@@ -236,18 +280,15 @@ class Head96:
     return HeadPlan(corner.x + disposal.x, corner.y + disposal.y, z)
 
   def _tip_length(self, mandrels: List[str]) -> float:
-    """The longest carried tip's effective length, cm: from the tips picked up this session, or
-    from the tip class the session state names (`biomek_<class>`)."""
+    """The longest carried tip's effective length, cm (`_carried_tip`)."""
     lengths = []
-    for i, model in enumerate(self.tips):
+    for i, key in enumerate(self.tips):
       name = mandrel_name(i // COLUMNS, i % COLUMNS)
-      if name not in mandrels:
+      if key is None or name not in mandrels:
         continue
-      tip = self._tips.get(name)
+      tip = self._carried_tip(name)
       if tip is not None:
         lengths.append(self.effective_tip_length(tip))
-      elif model and model.startswith("biomek_"):
-        lengths.append(self.effective_tip_length(biomek_tip(model[len("biomek_") :], "t")))
     if not lengths:
       raise RuntimeError(f"{self}: the carried tips' length is not known")
     return max(lengths)
@@ -295,14 +336,14 @@ class Head96:
     )
     await pod.move_axes({"Z": declared.to_counts("Z", plan.z)}, 1000)
     await self.load_tips(load)
-    picked = {}
+    picked: Dict[str, Optional[Tip]] = {}
     for mandrel, spot in plan.pairs:
       tip = spot.tip_for_pickup()
       if spot.tracks_tips:
         spot.unassign_tip()
       self._tips[mandrel] = tip
-      picked[mandrel] = tip.model
-    self._set_tips(picked)  # type: ignore[arg-type]
+      picked[mandrel] = tip
+    self._set_tips(picked)
     await pod.lift_channels(_cm(minimum_traverse_height_end))
 
   async def drop_tips(
@@ -399,3 +440,325 @@ class Head96:
     gr = declared.to_counts("GR", declared.park["GR"])
     if self._pod.cpositions["GR"][1] != gr:
       await self._pod.move_axes({"GR": gr})
+
+  # -- aspirate and dispense ----------------------------------------------------------------------
+
+  def _tip_on(self, mandrel: str) -> Tip:
+    tip = self._carried_tip(mandrel)
+    if tip is None:
+      row, column = mandrel_index(mandrel)
+      key = self.tips[row * COLUMNS + column]
+      raise RuntimeError(f"{self}: the tip on {mandrel} ({key or 'none'}) is not known")
+    return tip
+
+  def _wells(self, resource: Resource) -> Tuple[Tuple[str, Container], ...]:
+    """Each carrying mandrel and the container under it: the wells of a 96-well plate (mandrel A1
+    over well A1), or one container (a reservoir's, or a 1-well plate's) under every mandrel."""
+    carried = self._carried()
+    if isinstance(resource, Plate) and resource.num_items == ROWS * COLUMNS:
+      return tuple((m, resource.get_well(m)) for m in carried)
+    container: Optional[Resource] = resource
+    if isinstance(resource, Plate) and resource.num_items == 1:
+      container = resource.get_item(0)
+    if not isinstance(container, Container):
+      raise ValueError(
+        f"{self}: aspirate or dispense from a 96-well plate or one container, not {resource.name}"
+      )
+    return tuple((m, container) for m in carried)
+
+  def plan_liquid(
+    self,
+    operation: str,
+    resource: Resource,
+    volume: float,
+    settings: liquid.Settings,
+    flow_rate: float,
+  ) -> LiquidPlan:
+    """Where an aspirate (`operation` "aspirate") or dispense goes and the template's moves: mandrel
+    A1 over well A1 of a 96-well plate, or the head centred over one container; the liquid's levels
+    from the containers' trackers when volume tracking is on (else not known).
+
+    Raises:
+      ValueError: for a height that cannot be worked out (from the liquid, or following, in a
+        container without a height <-> volume function or with untracked contents).
+    """
+    deck, configuration, declared = self._context()
+    number = self._pod.pod_number
+    pairs = self._wells(resource)
+    tracking = does_volume_tracking()
+    share = len(pairs) if len({id(c) for _, c in pairs}) == 1 else 1
+    channels = []
+    for mandrel, container in pairs:
+      shape = liquid.ContainerShape(container)
+      tip = self._tip_on(mandrel)
+      channels.append(
+        liquid.Channel(
+          name=mandrel,
+          well=shape,
+          bottom=targeting.target(deck, configuration, number, container, z="b").z
+          + shape.floor / 10,
+          tip_length=self.effective_tip_length(tip),
+          volume=volume,
+          held=container.tracker.get_used_volume() if tracking else None,
+          tip_radius=tip.get_size_x() / 20,  # its diameter, mm -> its radius, cm
+          share=share,
+        )
+      )
+    geometry = declared.geometry
+    if share > 1:  # one container under the head: the head centred over it
+      centre = targeting.target(deck, configuration, number, pairs[0][1])
+      x = centre.x - (COLUMNS - 1) / 2 * geometry.mandrel_x_spacing
+      y = centre.y - (ROWS - 1) / 2 * geometry.mandrel_y_spacing
+    else:
+      at = targeting.target(deck, configuration, number, pairs[0][1])
+      row, column = mandrel_index(pairs[0][0])
+      x = at.x - column * geometry.mandrel_x_spacing
+      y = at.y - row * geometry.mandrel_y_spacing
+    plan = (liquid.plan_aspirate if operation == "aspirate" else liquid.plan_dispense)(
+      channels, settings, flow_rate
+    )
+    return LiquidPlan(x, y, tuple(channels), tuple(plan), tuple(pairs))
+
+  def moves(
+    self, plan: LiquidPlan, offset: Coordinate, d_start: float
+  ) -> List[Tuple[Dict[str, float], int, float]]:
+    """The plan as the head's moves after its travel to the well: (axis targets in Biomek's units:
+    X/Y/Z cm, D uL; speed field; delay s after). The approach carries `offset` (mm, PyLabRobot's
+    frame) as the reservoir templates' first move does; the plunger starts at `d_start` uL. One Z
+    serves every mandrel: the lowest any of them needs.
+
+    Raises:
+      ValueError: for a dispense of more than the tips hold.
+    """
+    x, y = plan.x + offset.x / 10, plan.y - offset.y / 10  # Biomek's Y runs to the front
+    d = d_start
+    out: List[Tuple[Dict[str, float], int, float]] = []
+    first = True
+    for step in plan.steps:
+      if isinstance(step, liquid.ZMove):
+        targets: Dict[str, float] = {"Z": min(step.z.values())}
+        if first and (offset.x or offset.y):
+          targets.update(X=x, Y=y)
+        first = False
+        out.append((targets, step.speed, 0.0))
+      elif isinstance(step, liquid.PlungerMove):
+        amount = next(iter(step.volume.values()))
+        before, d = d, 0.0 if step.empty else d + amount
+        if d < -PLUNGER_TOLERANCE:
+          raise ValueError(f"{self}: a dispense of {-amount:.3f} uL is more than the tips hold")
+        d = max(d, 0.0)
+        if abs(d - before) <= PLUNGER_TOLERANCE:
+          continue  # nothing to move (a 0 uL operation): Biomek sends no move
+        targets = {"D": round(d, 6)}
+        if step.z:
+          targets["Z"] = min(step.z.values())
+        out.append((targets, self._d_speed(step.flow_rate), step.delay))
+      elif step.dx or step.dy:
+        out.append(({"X": x + step.dx, "Y": y + step.dy}, step.speed, 0.0))
+        out.append(({"X": x, "Y": y}, step.speed, step.delay))
+    return out
+
+  def _d_speed(self, flow_rate: float) -> int:
+    """The `AM` speed field for the plunger at `flow_rate` uL/s: per mille of D's maximum."""
+    _, _, declared = self._context()
+    per_second = flow_rate * declared.conversion["D"].const
+    field = round(per_second / self._pod.axis("D").limits.max_velocity * 1000)
+    return max(1, min(1000, field))
+
+  def _settings(self, **given: Any) -> liquid.Settings:
+    """The template's settings: the arguments given, else this feature's `default_*`."""
+    base = liquid.Settings(liquid_height=self.default_liquid_height, z_speed=self.default_z_speed)
+    return liquid.settings(base, **given)
+
+  async def _run_liquid(
+    self,
+    plan: LiquidPlan,
+    offset: Coordinate,
+    minimum_traverse_height_start: Optional[float],
+    minimum_traverse_height_end: Optional[float],
+  ) -> None:
+    _, _, declared = self._context()
+    pod = self._pod
+    d_start = declared.to_value("D", pod.cpositions["D"][1])
+    # Below 0 the plunger is in the ejector's stroke (after homing or a tip load's push-off):
+    # Biomek brings it to 0 at full speed before pipetting.
+    below = d_start < -PLUNGER_TOLERANCE
+    moves = self.moves(plan, offset, 0.0 if below else d_start)  # checked before anything moves
+    if below:
+      await pod.move_axes({"D": declared.to_counts("D", 0.0)})
+    await self._clear_gripper()
+    await pod.move_over(
+      {"X": declared.to_counts("X", plan.x), "Y": declared.to_counts("Y", plan.y)},
+      minimum_traverse_height=_cm(minimum_traverse_height_start),
+    )
+    for targets, speed, delay in moves:
+      await pod.move_axes({a: declared.to_counts(a, v) for a, v in targets.items()}, speed)
+      if delay > 0:
+        await asyncio.sleep(delay)
+    await pod.lift_channels(_cm(minimum_traverse_height_end))
+
+  def _book(self, plan: LiquidPlan, volume: float, aspirate: bool) -> List[Any]:
+    """Move `volume` per mandrel between the containers' and the tips' trackers (pending, to commit
+    or roll back)."""
+    if not does_volume_tracking():
+      return []
+    booked = []
+    for mandrel, container in plan.pairs:
+      tip = self._tips.get(mandrel)
+      giver: Optional[VolumeTracker] = container.tracker
+      taker: Optional[VolumeTracker] = tip.tracker if tip is not None else None
+      if not aspirate:
+        giver, taker = taker, giver
+      if giver is not None:
+        booked.append(giver)
+        giver.remove_liquid(min(volume, giver.get_used_volume()))
+      if taker is not None:
+        booked.append(taker)
+        taker.add_liquid(volume)
+    return booked
+
+  async def _liquid(
+    self,
+    operation: str,
+    resource: Resource,
+    volume: float,
+    offset: Optional[Coordinate],
+    flow_rate: float,
+    settings: liquid.Settings,
+    start: Optional[float],
+    end: Optional[float],
+  ) -> None:
+    offset = offset or Coordinate.zero()
+    plan = self.plan_liquid(operation, resource, volume, settings, flow_rate)
+    aspirate = operation == "aspirate"
+    moved = volume + (settings.conditioning.excess if aspirate else 0.0)
+    logger.info(
+      "%s %s %.3f uL %s %s", self._pod.component, operation, volume,
+      "from" if aspirate else "into", resource.name,
+    )  # fmt: skip
+    booked = self._book(plan, moved, aspirate)
+    try:
+      await self._run_liquid(plan, offset, start, end)
+    except BaseException:
+      for tracker in booked:
+        tracker.rollback()
+      raise
+    for tracker in booked:
+      tracker.commit()
+
+  async def aspirate(
+    self,
+    resource: Resource,
+    volume: float,
+    offset: Optional[Coordinate] = None,
+    liquid_height: Optional[float] = None,
+    lld_mode: Optional[Any] = None,
+    flow_rate: Optional[float] = None,
+    *,
+    height_from: Optional[str] = None,
+    follow_liquid: Optional[bool] = None,
+    minimum_height: Optional[float] = None,
+    z_speed: Optional[float] = None,
+    approach_height: Optional[float] = None,
+    settling_time: Optional[float] = None,
+    blow_out_air_volume: Optional[float] = None,
+    transport_air_volume: Optional[float] = None,
+    conditioning: Optional[Conditioning] = None,
+    tip_touch: Optional[TipTouch] = None,
+    minimum_traverse_height_start: Optional[float] = None,
+    minimum_traverse_height_end: Optional[float] = None,
+  ) -> None:
+    """Draw `volume` uL into every carried tip, from a 96-well plate (mandrel A1 over well A1) or
+    one container (the head centred over it), as Biomek's "MC Pipetting" template does (see
+    `features/liquid.py`). `techniques.aspirate_arguments` gives the keywords a Biomek technique
+    stands for.
+
+    Args:
+      resource: a plate of 96 wells, or a container (a reservoir's well, a 1-well plate).
+      volume: uL per tip.
+      offset: added to the target, mm (a reservoir template's X offset is (-2, 0, 0)).
+      liquid_height: mm from `height_from` of the tips' ends while drawing
+        (`default_liquid_height`).
+      lld_mode: the head has no liquid-level sensor: None or OFF only.
+      flow_rate: uL/s (`default_flow_rate`).
+      height_from: "bottom" (default), "top" or "liquid" (needs volume tracking).
+      follow_liquid: the tips follow the liquid down as it is drawn.
+      minimum_height: mm above the bottom no height goes below (Biomek's Minimum Height).
+      z_speed: % of Z's maximum for the moves in the well (`default_z_speed`).
+      approach_height: mm above the top the head comes down to first (1).
+      settling_time: s after drawing (Biomek's aspirate delay).
+      blow_out_air_volume: uL of air drawn above the well first, for a blowout.
+      transport_air_volume: uL of air drawn after leaving the well (the trailing air gap).
+      conditioning: extra drawn and pushed back before leaving (Biomek's conditioning).
+      tip_touch: a touch-off before leaving.
+      minimum_traverse_height_start / _end: as `pick_up_tips`.
+
+    Raises:
+      NotImplementedError: for a liquid-level sensing mode.
+      RuntimeError: if the head carries no tips.
+      ValueError: for a resource or height that cannot be worked out, or more than the tips hold.
+    """
+    _no_lld(self, lld_mode)
+    settings = self._settings(
+      liquid_height=liquid_height, height_from=height_from, follow_liquid=follow_liquid,
+      minimum_height=minimum_height, z_speed=z_speed, approach_height=approach_height,
+      settling_time=settling_time, blow_out_air_volume=blow_out_air_volume,
+      transport_air_volume=transport_air_volume, conditioning=conditioning, tip_touch=tip_touch,
+    )  # fmt: skip
+    await self._liquid(
+      "aspirate", resource, volume, offset, flow_rate or self.default_flow_rate, settings,
+      minimum_traverse_height_start, minimum_traverse_height_end,
+    )  # fmt: skip
+
+  async def dispense(
+    self,
+    resource: Resource,
+    volume: float,
+    offset: Optional[Coordinate] = None,
+    liquid_height: Optional[float] = None,
+    lld_mode: Optional[Any] = None,
+    flow_rate: Optional[float] = None,
+    *,
+    height_from: Optional[str] = None,
+    follow_liquid: Optional[bool] = None,
+    minimum_height: Optional[float] = None,
+    z_speed: Optional[float] = None,
+    approach_height: Optional[float] = None,
+    settling_time: Optional[float] = None,
+    blow_out_air_volume: Optional[float] = None,
+    blow_out_delay: Optional[float] = None,
+    tip_touch: Optional[TipTouch] = None,
+    empty: bool = False,
+    minimum_traverse_height_start: Optional[float] = None,
+    minimum_traverse_height_end: Optional[float] = None,
+  ) -> None:
+    """Push `volume` uL out of every carried tip, into a 96-well plate or one container, as
+    Biomek's "MC Pipetting" template does (see `features/liquid.py`); arguments as `aspirate`.
+
+    Args:
+      follow_liquid: the tips follow the liquid up as it fills.
+      blow_out_air_volume: uL of air pushed out after the liquid (Biomek's blowout), then
+        `blow_out_delay` s.
+      empty: push out everything the tips hold, at the starting height (Biomek's Empty Tips).
+
+    Raises:
+      NotImplementedError: for a liquid-level sensing mode.
+      RuntimeError: if the head carries no tips.
+      ValueError: for a resource or height that cannot be worked out, or more than the tips hold.
+    """
+    _no_lld(self, lld_mode)
+    settings = self._settings(
+      liquid_height=liquid_height, height_from=height_from, follow_liquid=follow_liquid,
+      minimum_height=minimum_height, z_speed=z_speed, approach_height=approach_height,
+      settling_time=settling_time, blow_out_air_volume=blow_out_air_volume,
+      blow_out_delay=blow_out_delay, tip_touch=tip_touch, empty=empty,
+    )  # fmt: skip
+    await self._liquid(
+      "dispense", resource, volume, offset, flow_rate or self.default_flow_rate, settings,
+      minimum_traverse_height_start, minimum_traverse_height_end,
+    )  # fmt: skip
+
+
+def _no_lld(head: Head96, lld_mode: Any) -> None:
+  if lld_mode is not None and getattr(lld_mode, "name", lld_mode) != "OFF":
+    raise NotImplementedError(f"{head}: the 96-channel head has no liquid-level sensing")

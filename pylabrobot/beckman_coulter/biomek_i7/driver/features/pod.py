@@ -535,6 +535,56 @@ class Pod:
       ceilings[name] = ceiling
     return ceilings
 
+  async def park(self, over: Optional[Mapping[str, int]] = None) -> None:
+    """Biomek's park (`ParkLocation`): the channels and the gripper raised to their ceilings
+    (`traverse_ceilings`), the pod to the park X (`XMargin` in from its own end of the rail) and
+    `Y`, the gripper turned and closed to its park (`GR`, `GY`, then `GG`). As logged after a
+    prime (2026-10-09), to the count. `over`: X/Y targets (counts) for a pod whose park declares
+    none; a Span-8 parks over its wash station (`pipettes.park`). Without either, it parks where
+    it stands.
+
+    Raises:
+      RuntimeError: without a declared configuration.
+    """
+    d = self.declared
+    if d is None:
+      raise RuntimeError(f"{self} needs a declared configuration")
+    p = d.park
+    targets: Dict[str, int] = dict(over or {})
+    if "XMargin" in p and "X" not in targets:
+      low, high = d.limits["X"]
+      x = low + p["XMargin"] if self.side == "left" else high - p["XMargin"]
+      targets["X"] = d.to_counts("X", x)
+    if "Y" in p and "Y" not in targets:
+      targets["Y"] = d.to_counts("Y", p["Y"])
+    targets.update({a: d.to_counts(a, p[a]) for a in ("GR", "GY") if a in p})
+    await self.move_over(targets)
+    # The channels rest at the top less the park margin, and on a Span-8 less `DiscardOffset` as
+    # well (39.1079 cm on Z1, 9029 counts: lower than the probes travel, `traverse_ceilings`).
+    shuck = d.settings.get("DiscardOffset", 0.0) if self.module_type == "span8" else 0.0
+    rest = {
+      z: d.to_counts(z, d.limits[z][1] + p.get("ZMargin", 0.0) - shuck) for z in self.channel_z_axes
+    }
+    if any(self.cpositions[z][1] != c for z, c in rest.items()):
+      await self.move_axes(rest)
+    if "GG" in p:
+      await self.move_axes({"GG": d.to_counts("GG", p["GG"])})
+
+  async def move_aside(self) -> None:
+    """Raise the pod and take it to the end of its X travel on its own side (the left pod to its
+    lowest X, the right pod to its highest), leaving the other pod the most of the rail. Biomek
+    moves a pod out of the way itself; the rail guard here refuses instead
+    (`x_rail.py`), so a caller makes room with this.
+
+    Raises:
+      RuntimeError: without a declared configuration.
+    """
+    d = self.declared
+    if d is None:
+      raise RuntimeError(f"{self} needs a declared configuration")
+    low, high = d.limits["X"]
+    await self.move_over({"X": d.to_counts("X", low if self.side == "left" else high)})
+
   async def move_over(
     self,
     targets: Mapping[str, int],
