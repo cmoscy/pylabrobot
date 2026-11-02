@@ -41,6 +41,7 @@ from pylabrobot.resources.container import Container
 from pylabrobot.resources.coordinate import Coordinate
 from pylabrobot.resources.plate import Plate
 from pylabrobot.resources.resource import Resource
+from pylabrobot.resources.beckman_coulter.tips import beckman_coulter_biomek_tip_1070uL
 from pylabrobot.resources.tip import Tip
 from pylabrobot.resources.tip_rack import TipRack, TipSpot
 from pylabrobot.resources.volume_tracker import VolumeTracker, does_volume_tracking
@@ -60,6 +61,9 @@ ROWS, COLUMNS = 8, 12
 # 0.0043 uL on this head).
 PLUNGER_TOLERANCE = 0.01
 DEFAULT_TRASH = "TR1"
+# The longest tip the 96-head takes (1070 uL and 1025 uL classes: 10.9855 cm), assumed for a
+# precautionary discard when no tips are recorded (`discard_any_tips`).
+ASSUMED_TIP = beckman_coulter_biomek_tip_1070uL
 
 
 def _cm(height: Optional[float]) -> Optional[float]:
@@ -398,6 +402,31 @@ class Head96:
     self._set_tips({m: None for m in carried})
     await self._pod.lift_channels(_cm(minimum_traverse_height_end))
 
+  async def discard_any_tips(self, trash: Optional[Resource] = None) -> None:
+    """Eject into the trash (`TR1` by default) whatever tips the head may carry, recorded or not:
+    the head has no tip sensor, so a lost session state would otherwise leave tips on it unseen.
+    With tips recorded, as `discard_tips`; with none, the head travels and ejects as if it carried
+    the longest tip it takes (1070 uL, `ASSUMED_TIP`), so its travel clears the deck for any tip
+    and an ejected tip of any length falls into the bin. With no tips on, the eject runs over the
+    empty bin. `BiomekI7.setup` does this by default.
+
+    Raises:
+      RailCollisionError, ValueError: if the way to the trash is not clear for the longest tip
+        (the move is refused before anything is sent).
+    """
+    if any(t is not None for t in self.tips):
+      await self.discard_tips(trash)
+      return
+    length = self.effective_tip_length(ASSUMED_TIP("assumed tip"))
+    logger.warning(
+      "%s: discarding any tips on the 96-head (it cannot sense them), as if %.2f cm long",
+      self._pod.component,
+      length,
+    )
+    plan = self.plan_discard(length, trash)
+    await self._eject_at(plan, None, tip_length=length)
+    await self._pod.lift_channels(None, tip_lengths={"Z": length})
+
   def _carried(self) -> List[str]:
     carried = [
       mandrel_name(i // COLUMNS, i % COLUMNS) for i, t in enumerate(self.tips) if t is not None
@@ -406,7 +435,11 @@ class Head96:
       raise RuntimeError(f"{self} carries no tips")
     return carried
 
-  async def _eject_at(self, plan: HeadPlan, start: Optional[float]) -> None:
+  async def _eject_at(
+    self, plan: HeadPlan, start: Optional[float], tip_length: Optional[float] = None
+  ) -> None:
+    """Travel over `plan` and eject there. `tip_length`: the tip the travel clears the deck for,
+    cm; the recorded tips' when None."""
     _, _, declared = self._context()
     pod = self._pod
     logger.info("%s eject tips at X %.3f Y %.3f Z %.3f cm", pod.component, plan.x, plan.y, plan.z)
@@ -414,6 +447,7 @@ class Head96:
     await pod.move_over(
       {"X": declared.to_counts("X", plan.x), "Y": declared.to_counts("Y", plan.y)},
       minimum_traverse_height=_cm(start),
+      tip_lengths=None if tip_length is None else {"Z": tip_length},
     )
     await pod.move_axes({"Z": declared.to_counts("Z", plan.z)}, 1000)
     await self.eject()

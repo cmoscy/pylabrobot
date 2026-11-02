@@ -177,8 +177,9 @@ class BiomekI7Driver:
         fault, or a pod would move on the X rail beside a skipped pod whose X is not homed.
     """
     logger.warning(
-      "The Biomek i7 driver has not been verified on hardware beyond reading its boards. "
-      "Please report what works and what does not."
+      "The Biomek i7 driver has run on one instrument (Home All, prime, tips and transfers on "
+      "both heads, park), checked by eye; it is not yet verified against Biomek's logs on "
+      "hardware. Please report what works and what does not."
     )
     if not self._connected:
       await self._open()

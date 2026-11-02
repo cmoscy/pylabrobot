@@ -213,6 +213,7 @@ class BiomekI7(Resource):
     skip_right_pod: bool = False,
     force_initialize: bool = False,
     discard_tips: bool = True,
+    precautionary_discard: bool = True,
     park: bool = True,
   ) -> None:
     """Bring the instrument up. This homes the arms, then, as the STAR does, takes off any tips
@@ -226,6 +227,12 @@ class BiomekI7(Resource):
       discard_tips: shuck tips found on a pod that was brought up into its trash: on a Span-8 the
         probes the tip sensor finds a tip on, on the 96-head the tips the session state records
         (it has no tip sensor). Needs the trash position on the deck.
+      precautionary_discard: with `discard_tips`, eject into the 96-head's trash even when the
+        session state records no tips, as if the longest tip were on (`head96.discard_any_tips`),
+        as the STAR's 96-head initialization ejects into its waste: the head cannot sense tips,
+        and a lost state would leave them on unseen. False skips it, for an operator who has
+        checked the head is empty. A path to the trash that is not clear for the longest tip
+        refuses the move: clear it, or pass False.
       park: park every pod that was brought up (`park`).
     """
     await self._require_driver().setup(
@@ -237,15 +244,16 @@ class BiomekI7(Resource):
     self._follow_driver()
     skipped = {side for side, skip in (("left", skip_left_pod), ("right", skip_right_pod)) if skip}
     if discard_tips:
-      await self._discard_found_tips(skipped)
+      await self._discard_found_tips(skipped, precautionary_discard)
     if park:
       await self.park(skip=skipped)
 
-  async def _discard_found_tips(self, skipped: Set[str]) -> None:
+  async def _discard_found_tips(self, skipped: Set[str], precautionary: bool = True) -> None:
     """Shuck the tips found on the pods not `skipped` (`setup`'s `discard_tips`). A Span-8 probe
     the sensor finds a tip on that the session did not record is taken to carry the longest
     Biomek tip, so its travel to the trash clears the deck; a recorded tip the sensor does not
-    find is forgotten."""
+    find is forgotten. The 96-head, which has no sensor, discards whatever it may carry when
+    `precautionary`, else only the tips recorded."""
     names = set(self.deck.position_names)
     for pod in self.pods:
       if pod.side in skipped:
@@ -262,9 +270,12 @@ class BiomekI7(Resource):
           pipettes._set_tips({n: pipettes._carried_tip(n) or assumed for n in found})
           logger.warning("%s: tips found on probes %s; discarding them", pod, found)
           await pipettes.discard_tips(use_channels=[n - 1 for n in found])
-      if pod.head96 is not None and HEAD96_TRASH in names and any(pod.head96.tips):
-        logger.warning("%s: the 96-head carries tips, as recorded; discarding them", pod)
-        await pod.head96.discard_tips()
+      if pod.head96 is not None and HEAD96_TRASH in names:
+        if any(pod.head96.tips):
+          logger.warning("%s: the 96-head carries tips, as recorded; discarding them", pod)
+          await pod.head96.discard_tips()
+        elif precautionary:
+          await pod.head96.discard_any_tips()
 
   async def park(self, skip: Iterable[str] = ()) -> None:
     """Park the pods as Biomek does (`Pod.park`; a Span-8 over its wash station,
