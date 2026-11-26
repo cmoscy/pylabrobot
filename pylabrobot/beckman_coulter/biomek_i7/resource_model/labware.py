@@ -19,6 +19,7 @@ from pylabrobot.resources.beckman_coulter import (
   beckman_coulter_biomek_96_tiprack_230uL,
   beckman_coulter_biomek_96_tiprack_1025uL_filter,
   beckman_coulter_biomek_96_tiprack_1070uL,
+  beckman_coulter_biomek_96_tiprack_190uL_filter_conductive,
   beckman_coulter_biomek_96_wellplate_flat,
   beckman_coulter_biomek_modular_reservoir,
   beckman_coulter_biomek_reservoir,
@@ -27,6 +28,7 @@ from pylabrobot.resources.beckman_coulter import (
   beckman_coulter_biomek_tip_190uL_filter,
   beckman_coulter_biomek_tip_230uL,
   beckman_coulter_biomek_tip_1025uL_filter,
+  beckman_coulter_biomek_tip_190uL_filter_conductive,
   beckman_coulter_biomek_tip_1070uL,
 )
 from pylabrobot.resources.container import Container
@@ -42,6 +44,7 @@ TIPS: Dict[str, Callable[[str], BiomekTip]] = {
   "T230": beckman_coulter_biomek_tip_230uL,
   "T1025F": beckman_coulter_biomek_tip_1025uL_filter,
   "T1070": beckman_coulter_biomek_tip_1070uL,
+  "T190F_LLS": beckman_coulter_biomek_tip_190uL_filter_conductive,
 }
 TIP_BOXES: Dict[str, Callable[..., TipRack]] = {
   "BC50F": beckman_coulter_biomek_96_tiprack_50uL_filter,
@@ -49,6 +52,7 @@ TIP_BOXES: Dict[str, Callable[..., TipRack]] = {
   "BC230": beckman_coulter_biomek_96_tiprack_230uL,
   "BC1025F": beckman_coulter_biomek_96_tiprack_1025uL_filter,
   "BC1070": beckman_coulter_biomek_96_tiprack_1070uL,
+  "BC190F_LLS": beckman_coulter_biomek_96_tiprack_190uL_filter_conductive,
 }
 PLATES: Dict[str, Callable[..., Plate]] = {
   "BCFlat96": beckman_coulter_biomek_96_wellplate_flat,

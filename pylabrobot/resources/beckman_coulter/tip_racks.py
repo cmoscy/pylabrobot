@@ -15,11 +15,12 @@ from pylabrobot.resources.tip_rack import StandingTipRack, TipSpot
 from pylabrobot.resources.utils import create_ordered_items_2d
 
 from .tips import (
-  beckman_coulter_biomek_tip_50uL_filter,
-  beckman_coulter_biomek_tip_190uL_filter,
-  beckman_coulter_biomek_tip_230uL,
   beckman_coulter_biomek_tip_1025uL_filter,
   beckman_coulter_biomek_tip_1070uL,
+  beckman_coulter_biomek_tip_190uL_filter,
+  beckman_coulter_biomek_tip_190uL_filter_conductive,
+  beckman_coulter_biomek_tip_230uL,
+  beckman_coulter_biomek_tip_50uL_filter,
 )
 
 
@@ -171,6 +172,38 @@ def beckman_coulter_biomek_96_tiprack_1070uL(name: str, with_tips: bool = True) 
       size_x=5.6,  # wellradius 0.28 cm
       size_y=5.6,
       make_tip=beckman_coulter_biomek_tip_1070uL,
+      name_prefix=name,
+    ),
+    with_tips=with_tips,
+  )
+  rack.preferred_pickup_location = Coordinate(63.95, 42.7, -2.3)
+  return rack
+
+
+def beckman_coulter_biomek_96_tiprack_190uL_filter_conductive(
+  name: str, with_tips: bool = True
+) -> StandingTipRack:
+  """Biomek BC190F_LLS tip box: 96 T190F_LLS tips (`beckman_coulter_biomek_tip_190uL_filter_conductive`). Beckman Coulter tip box containing 96 LLS-capable, Aerosol Resistant T190 filter tips. Part no. B85922.
+
+  Labware class BC190F_LLS."""
+  rack = StandingTipRack(
+    name=name,
+    size_x=127.9,  # xspan 12.79 cm
+    size_y=85.4,  # yspan 8.54 cm
+    size_z=55.9,  # height 5.59 cm
+    model=beckman_coulter_biomek_96_tiprack_190uL_filter_conductive.__name__,
+    ordered_items=create_ordered_items_2d(
+      TipSpot,
+      num_items_x=12,
+      num_items_y=8,
+      dx=11.5,  # well1xoffset 1.45 cm, less the hole's radius
+      dy=8.2,  # the front row's hole; A1 (well1yoffset 1.12 cm) is at the back
+      dz=55.9,
+      item_dx=9.0,
+      item_dy=9.0,
+      size_x=6.0,  # wellradius 0.3 cm
+      size_y=6.0,
+      make_tip=beckman_coulter_biomek_tip_190uL_filter_conductive,
       name_prefix=name,
     ),
     with_tips=with_tips,

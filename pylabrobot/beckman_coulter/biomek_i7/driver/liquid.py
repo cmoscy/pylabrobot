@@ -155,6 +155,24 @@ class Settings:
   tip_touch: Optional[TipTouch] = None
   empty: bool = False
   mix: Optional["MixSettings"] = None
+  search: Optional["Search"] = None
+
+
+@dataclass(frozen=True)
+class Search:
+  """Liquid-level sensing before the first move measured from the liquid: the channels go to
+  `start_height` mm from the container's `start_from` ("top" or "bottom"; Biomek's "Move to ...
+  and start sensing from") at the operation's Z speed, then down at the speed field `speed` until
+  each senses the liquid, at most to `minimum_height` above the cavity bottom; `repeats`,
+  `accept_tolerance`, `fail_tolerance` and `move_to_start` as `techniques.LiquidSearch`."""
+
+  start_height: float = 0.0
+  start_from: str = "top"
+  speed: int = 200
+  repeats: int = 1
+  accept_tolerance: Optional[float] = None
+  fail_tolerance: Optional[float] = None
+  move_to_start: bool = True
 
 
 @dataclass(frozen=True)
@@ -277,6 +295,26 @@ class Touch:
 Step = Union[ZMove, PlungerMove, Touch]
 
 
+@dataclass(frozen=True)
+class Seek:
+  """Each channel's bottom (cm) where the search starts (`start`, at the speed field
+  `start_speed`), and how low it may go (`floor`, at `speed`) while its sensor looks for the
+  liquid."""
+
+  start: Dict[str, float]
+  floor: Dict[str, float]
+  start_speed: int
+  speed: int
+  repeats: int = 1
+  accept_tolerance: Optional[float] = None
+  fail_tolerance: Optional[float] = None
+  move_to_start: bool = True
+
+
+class LevelUnknown(ValueError):
+  """A height from the liquid in a container whose contents are not known."""
+
+
 def level(c: Channel, held: Optional[float]) -> Optional[float]:
   """The liquid's height above the bottom, cm, for `held` uL in the well (None: not known)."""
   return None if held is None else c.well.height(held)
@@ -289,7 +327,7 @@ def height_above_bottom(
   `minimum` mm.
 
   Raises:
-    ValueError: for a height from the liquid in a well whose contents are not known (Biomek's
+    LevelUnknown: for a height from the liquid in a well whose contents are not known (Biomek's
       "Cannot move relative to liquid level if liquid amounts are not defined").
   """
   if height_from == "bottom":
@@ -299,7 +337,7 @@ def height_above_bottom(
   elif height_from == "liquid":
     surface = level(c, held)
     if surface is None:
-      raise ValueError(
+      raise LevelUnknown(
         f"{c.name}: cannot move relative to the liquid level; the well's contents are not known"
       )
     z = height / 10 + surface
@@ -328,11 +366,11 @@ def touch_offset(c: Channel, above_bottom: float, touch: TipTouch) -> Tuple[floa
 
 
 def _touch(
-  channels: Sequence[Channel], s: Settings, held: Dict[str, Optional[float]]
-) -> List[Step]:
+  steps: List[Step], channels: Sequence[Channel], s: Settings, held: Dict[str, Optional[float]]
+) -> None:
   t = s.tip_touch
   if t is None:
-    return []
+    return
   # One move for every channel, measured at the last one (a Span-8 batch's highest-numbered probe),
   # as every logged Biomek touch-off is: where the channels stand at different heights, the others
   # reach further or less far than their own wells' room, as they do under Biomek.
@@ -343,10 +381,8 @@ def _touch(
   }
   above = zs[last.name] - last.bottom - last.tip_length
   dx, dy = touch_offset(last, above, t)
-  return [
-    ZMove(zs, fraction_to_field(t.speed_fraction), liquid=t.height_from == "liquid"),
-    Touch(dx, dy, fraction_to_field(t.speed_fraction), t.delay, above),
-  ]
+  steps.append(ZMove(zs, fraction_to_field(t.speed_fraction), liquid=t.height_from == "liquid"))
+  steps.append(Touch(dx, dy, fraction_to_field(t.speed_fraction), t.delay, above))
 
 
 def _top(c: Channel, mm: float) -> float:
@@ -354,15 +390,18 @@ def _top(c: Channel, mm: float) -> float:
 
 
 def _mix(
-  channels: Sequence[Channel], s: Settings, held: Dict[str, Optional[float]], at: Dict[str, float]
-) -> List[Step]:
+  steps: List[Step],
+  channels: Sequence[Channel],
+  s: Settings,
+  held: Dict[str, Optional[float]],
+  at: Dict[str, float],
+) -> None:
   """The Mix step's moves, the channels' bottoms at `at` (cm) over wells holding `held` uL: each
   cycle to the draw height, draw, to the push height, push. A move to where the channels already
   are is not sent (Biomek sends none: logged mixes at the dispense height have no Z moves)."""
   m = s.mix
   if m is None:
-    return []
-  steps: List[Step] = []
+    return
   where, contents = dict(at), dict(held)
   for _ in range(m.repetitions):
     for sign, height, height_from in (
@@ -394,7 +433,6 @@ def _mix(
       steps.append(PlungerMove({c.name: sign * m.volume for c in channels}, m.flow_rate, z=follow))
       where = {**where, **follow}
       contents = after
-  return steps
 
 
 def plan_aspirate(channels: Sequence[Channel], s: Settings, flow_rate: float) -> List[Step]:
@@ -403,16 +441,24 @@ def plan_aspirate(channels: Sequence[Channel], s: Settings, flow_rate: float) ->
   Raises:
     ValueError: for a height that cannot be worked out (see `height_above_bottom`).
   """
+  steps: List[Step] = []
+  _plan_aspirate(steps, channels, s, flow_rate)
+  return steps
+
+
+def _plan_aspirate(
+  steps: List[Step], channels: Sequence[Channel], s: Settings, flow_rate: float
+) -> None:
   held = {c.name: c.held for c in channels}
   approach = {c.name: _top(c, s.approach_height) for c in channels}
-  steps: List[Step] = [ZMove(approach, FULL_SPEED)]
+  steps.append(ZMove(approach, FULL_SPEED))
   if s.blow_out_air_volume > 0:
     steps.append(
       PlungerMove(
         {c.name: s.blow_out_air_volume for c in channels}, flow_rate, delay=s.settling_time
       )
     )
-  steps += _mix(channels, s, held, approach)
+  _mix(steps, channels, s, held, approach)
   start = {
     c.name: height_above_bottom(c, s.liquid_height, s.height_from, held[c.name], s.minimum_height)
     for c in channels
@@ -446,7 +492,7 @@ def plan_aspirate(channels: Sequence[Channel], s: Settings, flow_rate: float) ->
     for c in channels:
       if after[c.name] is not None:
         after[c.name] += s.conditioning.section_volume * c.share  # type: ignore[operator]
-  steps += _touch(channels, s, after)
+  _touch(steps, channels, s, after)
   steps.append(ZMove({c.name: _top(c, EXIT_ABOVE_TOP) for c in channels}, s.z_speed_field))
   if s.transport_air_volume > 0:
     steps.append(
@@ -454,7 +500,6 @@ def plan_aspirate(channels: Sequence[Channel], s: Settings, flow_rate: float) ->
         {c.name: s.transport_air_volume for c in channels}, flow_rate, delay=s.settling_time
       )
     )
-  return steps
 
 
 def plan_dispense(channels: Sequence[Channel], s: Settings, flow_rate: float) -> List[Step]:
@@ -463,8 +508,16 @@ def plan_dispense(channels: Sequence[Channel], s: Settings, flow_rate: float) ->
   Raises:
     ValueError: for a height that cannot be worked out (see `height_above_bottom`).
   """
+  steps: List[Step] = []
+  _plan_dispense(steps, channels, s, flow_rate)
+  return steps
+
+
+def _plan_dispense(
+  steps: List[Step], channels: Sequence[Channel], s: Settings, flow_rate: float
+) -> None:
   held = {c.name: c.held for c in channels}
-  steps: List[Step] = [ZMove({c.name: _top(c, s.approach_height) for c in channels}, FULL_SPEED)]
+  steps.append(ZMove({c.name: _top(c, s.approach_height) for c in channels}, FULL_SPEED))
   start = {
     c.name: height_above_bottom(c, s.liquid_height, s.height_from, held[c.name], s.minimum_height)
     for c in channels
@@ -494,7 +547,7 @@ def plan_dispense(channels: Sequence[Channel], s: Settings, flow_rate: float) ->
     )
   )
   at = {c.name: follow.get(c.name, _z(c, start[c.name])) for c in channels}
-  steps += _mix(channels, s, after, at)
+  _mix(steps, channels, s, after, at)
   if all(after[c.name] is not None for c in channels):
     steps.append(
       ZMove(
@@ -512,6 +565,58 @@ def plan_dispense(channels: Sequence[Channel], s: Settings, flow_rate: float) ->
         {c.name: -s.blow_out_air_volume for c in channels}, flow_rate, delay=s.blow_out_delay
       )
     )
-  steps += _touch(channels, s, after)
+  _touch(steps, channels, s, after)
   steps.append(ZMove({c.name: _top(c, EXIT_ABOVE_TOP) for c in channels}, s.z_speed_field))
-  return steps
+
+
+def plan_to_level(
+  operation: str, channels: Sequence[Channel], s: Settings, flow_rate: float
+) -> List[Step]:
+  """The template's moves for `operation` ("aspirate" or "dispense") up to the first that needs
+  the liquid's level, for containers whose contents are not known: what goes before Biomek's
+  sensing.
+
+  Raises:
+    ValueError: when no move needs the level (nothing to sense for), or for a height that cannot
+      be worked out otherwise.
+  """
+  steps: List[Step] = []
+  unknown = [dataclasses.replace(c, held=None) for c in channels]
+  try:
+    (_plan_aspirate if operation == "aspirate" else _plan_dispense)(steps, unknown, s, flow_rate)
+  except LevelUnknown:
+    return steps
+  raise ValueError(
+    f"no move of this {operation} is measured from the liquid: liquid-level sensing has nothing to"
+    " find"
+  )
+
+
+def seek(channels: Sequence[Channel], s: Settings) -> Seek:
+  """Where `s.search` starts each channel and how low it lets it go."""
+  search = s.search
+  if search is None:
+    raise ValueError("these settings ask for no liquid-level sensing")
+  start = {
+    c.name: _z(c, height_above_bottom(c, search.start_height, search.start_from, None, 0.0))
+    for c in channels
+  }
+  floor = {c.name: _z(c, s.minimum_height / 10) for c in channels}
+  for c in channels:
+    if start[c.name] <= floor[c.name]:
+      raise ValueError(
+        f"{c.name}: the search would start at or below its lowest point "
+        f"({s.minimum_height} mm above the bottom)"
+      )
+  if search.repeats < 1:
+    raise ValueError(f"a search is made at least once, not {search.repeats} times")
+  return Seek(
+    start, floor, s.z_speed_field, search.speed, search.repeats, search.accept_tolerance,
+    search.fail_tolerance, search.move_to_start,
+  )  # fmt: skip
+
+
+def surface_height(c: Channel, z: float) -> float:
+  """The liquid's height above the cavity bottom, mm, for a channel whose bottom stopped at `z`
+  (cm) on it."""
+  return (z - c.bottom - c.tip_length) * 10

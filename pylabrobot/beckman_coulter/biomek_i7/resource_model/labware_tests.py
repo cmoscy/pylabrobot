@@ -30,7 +30,7 @@ class LabwareByClassTests(unittest.TestCase):
     with self.assertRaises(NotImplementedError):
       biomek_labware("SmallTubeRack_Microfuge", "rack")
     with self.assertRaises(NotImplementedError):
-      biomek_tip("T190F_LLS", "t")
+      biomek_tip("T230_LLS", "t")
 
   def test_a_plate_takes_the_lid_its_definition_has(self) -> None:
     for lid in ("TiterplateLid", "titerplatelid", "default"):

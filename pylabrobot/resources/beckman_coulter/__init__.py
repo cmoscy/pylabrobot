@@ -13,6 +13,7 @@ from .tip_racks import (
   beckman_coulter_biomek_96_tiprack_230uL,
   beckman_coulter_biomek_96_tiprack_1025uL_filter,
   beckman_coulter_biomek_96_tiprack_1070uL,
+  beckman_coulter_biomek_96_tiprack_190uL_filter_conductive,
 )
 from .tips import (
   beckman_coulter_biomek_tip_50uL_filter,
@@ -20,4 +21,5 @@ from .tips import (
   beckman_coulter_biomek_tip_230uL,
   beckman_coulter_biomek_tip_1025uL_filter,
   beckman_coulter_biomek_tip_1070uL,
+  beckman_coulter_biomek_tip_190uL_filter_conductive,
 )

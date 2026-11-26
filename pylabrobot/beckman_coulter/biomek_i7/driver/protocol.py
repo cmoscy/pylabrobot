@@ -537,6 +537,13 @@ HARDWARE_NAMES = {
 # Tip sensor codes. 1 is "cannot determine" in the Master Controller's `VT` replies.
 TIP_STATES = {0x00: "loaded", 0x01: "unknown", 0x02: "unloaded"}
 
+# The sensor a Span-8 Z move stops on when sensing liquid (Set Move Parameters' sensor byte; the
+# Master Controller's log names it "LLS/CD"), and its trigger: 0 stops where liquid is sensed
+# ("SENSOR_TRIP"), as Biomek's liquid-level sensing does; 1 ("SENSOR_CLEAR") is clot detection's.
+LLS_CD_SENSOR = 15
+SENSOR_TRIP = 0
+SENSOR_CLEAR = 1
+
 # What an axis reports when its part of a Move All ends other than plainly. A 1-byte report is
 # one of the statuses; a 5-byte report is a type and the s32 position where its sensor fired.
 LLS_LIQUID_SENSED = 69

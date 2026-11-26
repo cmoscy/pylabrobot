@@ -134,6 +134,23 @@ touch-off, for any PyLabRobot container from its height <-> volume function. A s
 does not build yet is refused, never run without it. The Span-8's tips are checked by its tip
 sensor; it cannot drop tips into a rack, only discard them.
 
+**I16. The Span-8 senses the liquid as Biomek does, with STAR's arguments.** With
+`lld_mode=LLDMode.CAPACITIVE` and conductive tips, an `aspirate` or `dispense` searches before its
+first move measured from the liquid, as Biomek's logs show (2026-11-25): the sensors' sensitivity
+(`SS`), the probes to the search's start (0 mm from the top by default) at the operation's Z speed,
+then down at `search_speed` with the LLS/CD sensor armed, each probe stopping where it meets the
+liquid, at most to the minimum height above the bottom. A stop is answered in target counts (the
+drive's position less the channel's hysteresis), the axis's position read back before the next move,
+as the Master Controller does. Each container's contents are set from what its probes found, and
+the template goes on `immersion_depths` under each probe's own surface; an aspirate of more than was
+found, a dispense that would overfill, or a probe that met no liquid raises once the probes are
+lifted to where a finished operation leaves them (`minimum_traverse_height_end`). Biomek itself
+leaves them at the search's floor for its recovery (retry, pipette air or from the bottom, a
+prompt); the driver has no recovery, so it raises as STAR does.
+`probe_liquid_heights` / `probe_liquid_volumes` search without pipetting. `LiquidSearch` carries
+Biomek's own settings: where the search starts, repeated searches judged by the volume they find,
+with accept and fail tolerances.
+
 `head96` is the Multichannel pod's. Its tips are loaded force-limited by the MC's `LT`
 (`driver/recipes/tip_load.py`, its arguments from the configuration) and ejected by the plunger's
 shuck. It has no tip sensor, so `setup` ejects over its trash even with no tips recorded
@@ -175,9 +192,11 @@ guard (I7) and the move check (I12).
 ## Not in this driver
 
 The deck's devices (shakers, Peltiers, the tilting ALP, the washer, the camera) are separate
-devices, or chassis features once their protocol is known. Liquid-level sensing, prewetting, clot
-detection and Biomek's volume calibration are not built: the Span-8 refuses liquid-level sensing,
-and a Biomek technique that turns any of them on is refused (`techniques.py`).
+devices, or chassis features once their protocol is known. Prewetting, clot detection (a
+step of its own, for fixed tips), Biomek's volume calibration and its recovery from a failed
+liquid search (retries, pipetting from the bottom or above the well) are not built: a Biomek
+technique that turns prewetting or calibration on is refused (`techniques.py`), and a failed search
+raises.
 
 ## Rules the operations keep that are not PyLabRobot's own
 

@@ -49,6 +49,7 @@ from pylabrobot.beckman_coulter.biomek_i7.driver.simulator import (
   RECORDING_ENV,
   sense_recorded_tips,
   simulate_grips,
+  simulate_liquid,
   simulated_boards,
 )
 from pylabrobot.beckman_coulter.biomek_i7.resource_model import cm, pod_model
@@ -783,6 +784,7 @@ def BiomekI7(
     driver = BiomekI7Driver(declared_configuration_json=declared_configuration_json, boards=boards)
     sense_recorded_tips(driver, boards)  # the simulator does not model tips
     simulate_grips(driver, boards)  # nor labware between the fingers
+    simulate_liquid(driver, boards)  # nor liquid under the probes
   elif driver is None:
     driver = BiomekI7Driver(declared_configuration_json=declared_configuration_json)
   return BiomekI7Device(driver=driver, deck=deck, name=name, state_json=state_json)

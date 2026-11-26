@@ -94,3 +94,20 @@ def beckman_coulter_biomek_tip_1070uL(name: str) -> BiomekTip:
     cone_length=19.8374,  # coniclength 1.98374 cm
     is_conductive=False,  # lls
   )
+
+
+def beckman_coulter_biomek_tip_190uL_filter_conductive(name: str) -> BiomekTip:
+  """Biomek T190F_LLS tip, 190 uL, filter: tip class T190F_LLS."""
+  return BiomekTip(
+    name=name,
+    model=beckman_coulter_biomek_tip_190uL_filter_conductive.__name__,
+    diameter=4.826,  # maxtipradius 0.2413 cm
+    size_z=51.435,  # tipheight 5.1435 cm
+    has_filter=True,
+    maximal_volume=190.0,  # capacity
+    nominal_volume=190.0,
+    fitting_depth=7.75,  # spanseatingdepth 0.775 cm
+    end_diameter=1.27,  # mintipradius 0.0635 cm
+    cone_length=28.194,  # coniclength 2.8194 cm
+    is_conductive=True,  # lls
+  )

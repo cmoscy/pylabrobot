@@ -124,16 +124,19 @@ ENABLE_SECONDS_PER_AXIS = 9.0
 @dataclass(frozen=True)
 class MoveResult:
   """What a coordinated move did: the motions it sent (empty when every axis was already there),
-  and each axis's report that was not a plain finish. A sensor stop says where
-  (`MotionComplete.position`)."""
+  each axis's report that was not a plain finish (a sensor stop's carries the drive's position,
+  `MotionComplete.position`), and where each sensor stop leaves the axis in the counts targets are
+  given in (`stopped_at`)."""
 
   motions: List[motion.Motion] = field(default_factory=list)
   completions: Dict[str, p.MotionComplete] = field(default_factory=dict)
+  sensed: Dict[str, int] = field(default_factory=dict)
 
   def stopped_at(self, axis: str) -> Optional[int]:
-    """Where a sensor stopped `axis`, in counts; None if none did."""
-    complete = self.completions.get(axis)
-    return complete.position if complete is not None else None
+    """Where a sensor stopped `axis`, in the counts `move_axes` targets are given in (the drive's
+    position with the axis's hysteresis taken out, as the Master Controller replies to Biomek's
+    `AM`); None if none did."""
+    return self.sensed.get(axis)
 
 
 # How long this driver waits for a board to answer a Home, in seconds. The longest homing seen
@@ -925,10 +928,11 @@ class Pod:
         axis stops where that force stalls it (a grip, a tip pressed on); its position is then
         not known until read, which the next move does.
       sensors: per axis, the (sensor, trigger) that stops it where the sensor fires (a Span-8 Z
-        sensing liquid). Where it stopped is in the result and becomes the axis's position, as
-        the Master Controller keeps it. Whether liquid not sensed or a clot is an
-        error is the caller's to decide (the Master Controller fails the `AM` for the first and
-        reports the second).
+        sensing liquid: `p.LLS_CD_SENSOR`, trigger 0). Where it stopped is in the result
+        (`MoveResult.stopped_at`, in target counts); as the Master Controller does, the axis's
+        position is then unknown and read (Stop Motion Service, enable, read) before the next
+        move. Whether liquid not sensed is an error is the caller's to decide (the Master
+        Controller fails the `AM` for it, or only answers, as Biomek asks it).
 
     Returns:
       The motions sent and how the axes ended.
@@ -1036,15 +1040,18 @@ class Pod:
     # positions become unknown (adjusted as before), read before the next move.
     if forces:
       self._forget_positions(forces, before)
-    # A sensor stop reports where it stopped; the Master Controller takes that as the position.
+    # A sensor stop reports where the drive stopped. As the Master Controller does, the axis's
+    # position becomes unknown (adjusted as planned), read before the next move; the stop is
+    # answered in target counts, from the record before the move.
+    sensed: Dict[str, int] = {}
     for name, complete in completions.items():
       if complete.position is not None and name not in forces:
         axis = self.axis(name)
-        self._cpositions[name] = motion.update_cpos(
-          self._cpositions[name], complete.position, axis.hysteresis
-        )
+        sensed[name] = motion.update_cpos(before[name], complete.position, axis.hysteresis)[1]
+    if sensed:
+      self._forget_positions(sensed)
     self._positions_changed()
-    return MoveResult(list(motions), completions)
+    return MoveResult(list(motions), completions, sensed)
 
   # -- travel over the deck (design.md I12) -------------------------------------------
 
@@ -1421,9 +1428,10 @@ class Pod:
     Raises:
       ValueError: for a height a channel cannot lift its tip to. Nothing is sent.
     """
+    # Read first: the default heights depend on where the channels stand (a sensed stop is unknown).
+    await self._read_unknown_positions()
     lengths = self._carried_tip_lengths() if tip_lengths is None else tip_lengths
     heights, _, _ = self._traverse_targets(minimum_traverse_height, lengths)
-    await self._read_unknown_positions()
     await self._raise_to({n: heights[n] for n in self.channel_z_axes}, speed)
 
   async def _raise_to(self, heights: Mapping[str, float], speed: int) -> None:

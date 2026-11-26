@@ -27,7 +27,9 @@ from pylabrobot.resources import cor_96_wellplate_360uL_Fb, set_volume_tracking
 from pylabrobot.resources.errors import TooLittleLiquidError
 
 
-class LiquidTests(PodMoveTest):
+class LiquidTest(PodMoveTest):
+  """Helpers: the deck of the logged dilution, and the moves a pod is asked for."""
+
   async def setup_deck(self):  # type: ignore[no-untyped-def]
     set_volume_tracking(True)
     self.addCleanup(set_volume_tracking, False)
@@ -73,6 +75,8 @@ class LiquidTests(PodMoveTest):
     travel = max(i for i, (t, _) in enumerate(moves) if "X" in t and not any("Z" in k for k in t))
     return [m for m in moves[travel + 1 :] if not set(m[0]) <= {"Z", "GZ"} or m[1] != 1000][:99]
 
+
+class LiquidTests(LiquidTest):
   async def test_a_batchs_touch_off_is_measured_at_its_last_probe(self) -> None:
     # One touch-off moves every probe of a batch; Biomek's logged touch-offs (e.g. 2026-10-20's
     # dilution, where the probes followed different amounts up) are measured at the batch's last

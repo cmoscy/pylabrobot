@@ -44,6 +44,7 @@ to waste. Carrying probes travel no higher than the top less `DiscardOffset`
 
 import asyncio
 import collections
+import dataclasses
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
@@ -57,6 +58,8 @@ from pylabrobot.beckman_coulter.biomek_i7.resource_model.heads import shaft_of, 
 from pylabrobot.beckman_coulter.biomek_i7.techniques import (
   Conditioning,
   HeightFrom,
+  LiquidSearch,
+  LLDMode,
   MixHeights,
   TipTouch,
 )
@@ -203,6 +206,9 @@ class ProbePlan:
   channels: Tuple[liquid.Channel, ...]
   steps: Tuple[liquid.Step, ...]
   pairs: Tuple[Tuple[int, Container], ...]
+  # With liquid-level sensing: `steps` end where the liquid's level is first needed, and this is
+  # the search that finds it; the rest is planned from what it finds.
+  seek: Optional[liquid.Seek] = None
 
 
 def tip_problems(states: Sequence[Optional[str]], expected: Mapping[int, bool]) -> List[str]:
@@ -224,6 +230,8 @@ def tip_problems(states: Sequence[Optional[str]], expected: Mapping[int, bool]) 
 class Pipettes:
   """The eight channels of a Span-8 pod."""
 
+  LLDMode = LLDMode
+
   # Where neither the caller nor a technique gives a value (STAR P6): the tips' ends 1 mm above
   # the bottom, Biomek's Water liquid type's 90 uL/s and cutoff velocity, the Z speed and the
   # conductivity of its S8 techniques.
@@ -232,6 +240,13 @@ class Pipettes:
   default_z_speed: float = 109.3  # mm/s: its S8 techniques' 30 % of a Span-8 Z on this unit
   default_cutoff_velocity: float = 150.0  # uL/s
   default_lls_sensitivity: int = 3500
+  # Liquid-level sensing (`lld_mode=LLDMode.CAPACITIVE`): how far under the surface found the tips
+  # go (STAR's default, and its S8 techniques' 2 mm under the liquid), how fast they search
+  # (Biomek's default sense speed, 20 % of a Span-8 Z on this unit) and where from (Biomek's
+  # default: 0 mm from the container's top, once).
+  default_immersion_depth: float = 2.0  # mm
+  default_search_speed: float = 72.9  # mm/s
+  default_liquid_search: LiquidSearch = LiquidSearch()
 
   def __init__(self, pod: "Pod"):
     self._pod = pod
@@ -986,6 +1001,11 @@ class Pipettes:
       for probe, container, volume in members:
         shape = liquid.ContainerShape(container)
         tip = self._tip_of(probe)
+        if settings.search is not None and not getattr(tip, "is_conductive", False):
+          raise ValueError(
+            f"{self}: probe {probe}'s tip cannot sense liquid: liquid-level sensing needs "
+            "conductive tips (Biomek's LLS tips)"
+          )
         chans.append(
           liquid.Channel(
             name=f"Z{probe}",
@@ -999,20 +1019,38 @@ class Pipettes:
             share=share[id(container)],
           )
         )
-      steps = (liquid.plan_aspirate if operation == "aspirate" else liquid.plan_dispense)(
-        chans, settings, flow_rate
-      )
+      seek: Optional[liquid.Seek] = None
+      if settings.search is not None:
+        for _, container, _ in members:
+          if not container.supports_compute_height_volume_functions():
+            raise ValueError(
+              f"{self}: {container.name} has no height <-> volume function: liquid-level sensing "
+              "needs one to know what it found"
+            )
+        steps = liquid.plan_to_level(operation, chans, settings, flow_rate)
+        seek = liquid.seek(chans, settings)
+      else:
+        steps = (liquid.plan_aspirate if operation == "aspirate" else liquid.plan_dispense)(
+          chans, settings, flow_rate
+        )
       plans.append(
-        ProbePlan(x, y1, span, tuple(chans), tuple(steps), tuple((p, c) for p, c, _ in members))
+        ProbePlan(
+          x, y1, span, tuple(chans), tuple(steps), tuple((p, c) for p, c, _ in members), seek
+        )
       )
     return plans
 
   def moves(
-    self, plan: ProbePlan, offset: Coordinate, d_start: Mapping[str, float]
+    self,
+    plan: ProbePlan,
+    offset: Coordinate,
+    d_start: Mapping[str, float],
+    approach: bool = True,
   ) -> List[Tuple[Dict[str, float], int, float, bool]]:
     """One batch's moves after the travel: (axis targets in Biomek's units, Z1..Z8 / X / Y / S
     cm, D1..D8 uL; speed field; delay s after; whether its sensors' sensitivity is set first). The
-    approach carries `offset` (mm) with X/Y/S, as the reservoir templates' first move does. The
+    approach carries `offset` (mm) with X/Y/S, as the reservoir templates' first move does (not
+    when `approach` is False: the steps go on from a search for the liquid). The
     plungers start at `d_start` uL and stop at `SystemTrailingAirgap`, the air that keeps the
     system liquid from the sample.
 
@@ -1026,7 +1064,7 @@ class Pipettes:
       f"D{name[1:]}": d_start.get(f"D{name[1:]}", floor) for name in (c.name for c in plan.channels)
     }
     out: List[Tuple[Dict[str, float], int, float, bool]] = []
-    first = True
+    first = approach
     for step in plan.steps:
       if isinstance(step, liquid.ZMove):
         targets: Dict[str, float] = dict(step.z)
@@ -1072,13 +1110,19 @@ class Pipettes:
 
   async def _run_liquid(
     self,
+    operation: str,
     plans: List[ProbePlan],
+    settings: liquid.Settings,
+    flow_rate: float,
     offset: Coordinate,
     cutoff_velocity: float,
     lls_sensitivity: int,
     minimum_traverse_height_start: Optional[float],
     minimum_traverse_height_end: Optional[float],
+    booked: List[VolumeTracker],
   ) -> None:
+    """Carry out `plans`. A batch that searches for the liquid books its volumes into `booked`
+    once it knows them (the others are booked by the caller)."""
     _, _, declared = self._context()
     pod = self._pod
     pumps = [f"D{n}" for n in range(1, PROBES + 1)]
@@ -1092,37 +1136,223 @@ class Pipettes:
     # every pump (at 20 %) when a method starts; a pump below it draws it before pipetting.
     short = [a for a in pumps if d_start.get(a, 0.0) < gap - PLUNGER_TOLERANCE]
     d_start.update({a: gap for a in short})
-    batches = []
-    for plan in plans:  # all checked before anything moves
-      moves = self.moves(plan, offset, d_start)
-      for targets, _, _, _ in moves:
-        d_start.update({a: v for a, v in targets.items() if a.startswith("D")})
-      batches.append((plan, moves))
+    d = dict(d_start)
+    for plan in plans:  # all checked before anything moves (a search's as if it found full wells)
+      check = plan if plan.seek is None else self._as_if_full(operation, plan, settings, flow_rate)
+      for targets, _, _, _ in self.moves(check, offset, d):
+        d.update({a: v for a, v in targets.items() if a.startswith("D")})
     if short:
       if any(self._pod._valves.get(a) != "output" for a in pumps):
         await self.set_valves({a: "output" for a in pumps})
       await pod.move_axes({a: declared.to_counts(a, gap) for a in pumps}, AIR_GAP_SPEED)
     self._set_cutoff_velocity(cutoff_to_counts(self._pod, "D1", cutoff_velocity))
+    extra = settings.conditioning.excess if operation == "aspirate" else 0.0
+    d = dict(d_start)
+    end = minimum_traverse_height_end
     # Each batch's travel is planned, nothing exempt; its own moves work in its containers'
     # positions, the last batch's through the rise out.
-    for i, (plan, moves) in enumerate(batches):
+    for i, plan in enumerate(plans):
       await self._travel(plan.x, plan.y, plan.span, minimum_traverse_height_start)
       with pod.working_at(*(c for _, c in plan.pairs)):
-        for targets, speed, delay, sense in moves:
-          if sense:
-            await self._set_lls_sensitivity(lls_sensitivity)
-          if any(a.startswith("D") for a in targets) and any(
-            self._pod._valves.get(a) != "output" for a in targets if a.startswith("D")
-          ):
-            await self.set_valves({a: "output" for a in pumps})
-          await pod.move_axes({a: declared.to_counts(a, v) for a, v in targets.items()}, speed)
-          if delay > 0:
-            await asyncio.sleep(delay)
+        await self._send_moves(self.moves(plan, offset, d), lls_sensitivity, d)
+        if plan.seek is not None:
+          try:
+            surfaces = await self._sense(plan, lls_sensitivity)
+            rest = self._after_seek(operation, plan, settings, flow_rate, surfaces)
+            booked += self._book([rest], extra, operation == "aspirate")
+          except BaseException:
+            # Biomek leaves the probes where the search stopped (its recovery decides); the
+            # driver raises, so it leaves them where a finished operation would.
+            await pod._lift_channels(None if end is None else end / 10)
+            raise
+          # The search set the sensors' sensitivity: the move from the liquid follows at once.
+          await self._send_moves(
+            self.moves(rest, offset, d, approach=False), lls_sensitivity, d, sensitivity_set=True
+          )
         # Biomek turns every valve to output after each operation (`VO 255`).
         await self.set_valves({a: "output" for a in pumps})
-        if i == len(batches) - 1:
-          end = minimum_traverse_height_end
+        if i == len(plans) - 1:
           await pod._lift_channels(None if end is None else end / 10)
+
+  async def _send_moves(
+    self,
+    moves: List[Tuple[Dict[str, float], int, float, bool]],
+    lls_sensitivity: int,
+    d: Dict[str, float],
+    sensitivity_set: bool = False,
+  ) -> None:
+    """Send a batch's `moves` (`moves()`), keeping `d`, the plungers' uL, up to date. With
+    `sensitivity_set`, the first move measured from the liquid goes without setting it again."""
+    _, _, declared = self._context()
+    pumps = [f"D{n}" for n in range(1, PROBES + 1)]
+    for targets, speed, delay, sense in moves:
+      if sense and not sensitivity_set:
+        await self._set_lls_sensitivity(lls_sensitivity)
+      sensitivity_set = False
+      if any(a.startswith("D") for a in targets) and any(
+        self._pod._valves.get(a) != "output" for a in targets if a.startswith("D")
+      ):
+        await self.set_valves({a: "output" for a in pumps})
+      await self._pod.move_axes({a: declared.to_counts(a, v) for a, v in targets.items()}, speed)
+      d.update({a: v for a, v in targets.items() if a.startswith("D")})
+      if delay > 0:
+        await asyncio.sleep(delay)
+
+  # -- liquid-level sensing -----------------------------------------------------------------------
+
+  @staticmethod
+  def _planner(operation: str) -> Any:
+    return liquid.plan_aspirate if operation == "aspirate" else liquid.plan_dispense
+
+  def _as_if_full(
+    self, operation: str, plan: ProbePlan, settings: liquid.Settings, flow_rate: float
+  ) -> ProbePlan:
+    """`plan` as if its search found each container full (an aspirate) or empty (a dispense):
+    what is checked before anything moves (the plungers' travel does not depend on what is
+    found)."""
+    chans = tuple(
+      dataclasses.replace(c, held=float(container.max_volume) if operation == "aspirate" else 0.0)
+      for c, (_, container) in zip(plan.channels, plan.pairs)
+    )
+    steps = self._planner(operation)(chans, dataclasses.replace(settings, search=None), flow_rate)
+    return dataclasses.replace(plan, channels=chans, steps=tuple(steps), seek=None)
+
+  async def _sense(self, plan: ProbePlan, lls_sensitivity: int) -> Dict[str, Optional[float]]:
+    """Biomek's search for the liquid, for one batch, as its logs show it (2026-11-25): the
+    sensors' sensitivity (`SS`), the probes to the search's start at the operation's Z speed, then
+    down at the search's speed until each senses the liquid (sensor LLS/CD, "SENSOR_TRIP"), at
+    most to its floor. Returns, per channel, the liquid's height above its container's cavity
+    bottom, mm; None where it sensed none."""
+    seek = plan.seek
+    assert seek is not None
+    _, _, declared = self._context()
+    pod = self._pod
+
+    def counts(targets: Mapping[str, float]) -> Dict[str, int]:
+      return {a: declared.to_counts(a, v) for a, v in targets.items()}
+
+    await self._set_lls_sensitivity(lls_sensitivity)
+    sensors = {a: (p.LLS_CD_SENSOR, p.SENSOR_TRIP) for a in seek.floor}
+    previous: Optional[Dict[str, float]] = None
+    for search in range(1, seek.repeats + 1):
+      if seek.move_to_start:
+        await pod.move_axes(counts(seek.start), seek.start_speed)
+      self._simulate_liquid(plan)
+      result = await pod.move_axes(counts(seek.floor), seek.speed, sensors=sensors)
+      surfaces: Dict[str, Optional[float]] = {}
+      for c in plan.channels:
+        at = result.stopped_at(c.name)
+        surfaces[c.name] = (
+          None if at is None else liquid.surface_height(c, declared.to_value(c.name, at))
+        )
+      logger.info(
+        "%s LLS %s", pod.component,
+        {n: None if h is None else round(h, 3) for n, h in surfaces.items()},
+      )  # fmt: skip
+      if seek.repeats == 1 or any(h is None for h in surfaces.values()):
+        return surfaces
+      # Each search is judged as the volume up to where each probe stopped; the first is kept to
+      # compare the next with, the last is refused when unsteady, one between ends the searching
+      # when every probe agrees with its search before.
+      volumes = {
+        c.name: c.well.container.compute_volume_from_height(surfaces[c.name])  # type: ignore[arg-type]
+        for c in plan.channels
+      }
+      if previous is not None:
+        change = {n: abs(volumes[n] - previous[n]) for n in volumes}
+        if search == seek.repeats:
+          if seek.fail_tolerance is not None and any(
+            v > seek.fail_tolerance for v in change.values()
+          ):
+            worst = max(change, key=change.__getitem__)
+            raise RuntimeError(
+              f"{self}: the liquid under probe {worst[1:]} is not steady: its last two searches "
+              f"differ by {change[worst]:.2f} uL, more than {seek.fail_tolerance} uL"
+            )
+        elif seek.accept_tolerance is not None and all(
+          v <= seek.accept_tolerance for v in change.values()
+        ):
+          return surfaces
+      previous = volumes
+    return surfaces
+
+  def _simulate_liquid(self, plan: ProbePlan) -> None:
+    """In simulation, have each probe's sensor fire at the liquid its container's tracker holds."""
+    driver = self._pod.driver
+    if driver is None or driver.simulated_liquid is None:
+      return
+    _, _, declared = self._context()
+    levels: Dict[str, Optional[int]] = {}
+    for c, (_, container) in zip(plan.channels, plan.pairs):
+      volume = container.tracker.get_used_volume() if does_volume_tracking() else 0.0
+      if volume <= 0:
+        levels[c.name] = None
+        continue
+      z = c.bottom + c.tip_length + container.compute_height_from_volume(volume) / 10
+      # On the way down the drive stops past the target counts by the channel's hysteresis.
+      levels[c.name] = declared.to_counts(c.name, z) + self._pod.axis(c.name).hysteresis
+    driver.simulated_liquid(self._pod, levels)
+
+  def _after_seek(
+    self,
+    operation: str,
+    plan: ProbePlan,
+    settings: liquid.Settings,
+    flow_rate: float,
+    surfaces: Mapping[str, Optional[float]],
+  ) -> ProbePlan:
+    """The rest of `plan` once its search found `surfaces`: each container's contents set from
+    its probes' heights (Biomek sets them from what it senses), and the template planned on from
+    the move that needs them.
+
+    Raises:
+      RuntimeError: a probe sensed no liquid; an aspirate of more than was found (Biomek's 557),
+        or a dispense that would overfill the container (558).
+    """
+    missing = [int(n[1:]) for n, h in surfaces.items() if h is None]
+    if missing:
+      raise RuntimeError(f"{self}: no liquid found under probe(s) {missing}")
+    held = {
+      c.name: c.well.container.compute_volume_from_height(surfaces[c.name])  # type: ignore[arg-type]
+      for c in plan.channels
+    }
+    by_container: Dict[int, List[liquid.Channel]] = collections.defaultdict(list)
+    for c in plan.channels:
+      by_container[id(c.well.container)].append(c)
+    for chans in by_container.values():
+      container = chans[0].well.container
+      found = sum(held[c.name] for c in chans) / len(chans)
+      moved = sum(c.volume for c in chans)
+      if operation == "aspirate":
+        moved += settings.conditioning.excess * len(chans)
+        if moved > found + 1e-6:
+          raise RuntimeError(
+            f"{self}: {container.name} holds {found:.2f} uL as sensed, less than the "
+            f"{moved:.2f} uL to aspirate"
+          )
+      elif found + moved > container.max_volume + 1e-6:
+        raise RuntimeError(
+          f"{self}: {container.name} holds {found:.2f} uL as sensed; {moved:.2f} uL more would "
+          f"overfill it ({container.max_volume} uL)"
+        )
+      if does_volume_tracking():
+        container.tracker.set_volume(found)
+    known = tuple(dataclasses.replace(c, held=held[c.name]) for c in plan.channels)
+    steps = self._planner(operation)(known, dataclasses.replace(settings, search=None), flow_rate)
+    return dataclasses.replace(
+      plan, channels=known, steps=tuple(steps[len(plan.steps) :]), seek=None
+    )
+
+  async def _rise_out(self, plan: ProbePlan, settings: liquid.Settings) -> None:
+    """The probes up to 1 mm above their containers (the templates' way out), at the Z speed."""
+    _, _, declared = self._context()
+    await self._pod.move_axes(
+      {
+        c.name: declared.to_counts(c.name, liquid._top(c, liquid.EXIT_ABOVE_TOP))
+        for c in plan.channels
+      },
+      settings.z_speed_field,
+    )
 
   def _book(self, plans: List[ProbePlan], extra: float, aspirate: bool) -> List[Any]:
     """Move each probe's volume (+ `extra`) between its container's and its tip's trackers
@@ -1206,11 +1436,18 @@ class Pipettes:
       "%s %s %s uL on probes %s", self._pod.component, operation, list(volumes),
       [p for plan in plans for p, _ in plan.pairs],
     )  # fmt: skip
-    booked = self._book(plans, settings.conditioning.excess if aspirate else 0.0, aspirate)
+    # With a search, each batch books what it moves once it knows what its containers hold.
+    booked = (
+      []
+      if settings.search is not None
+      else self._book(plans, settings.conditioning.excess if aspirate else 0.0, aspirate)
+    )
     try:
       await self._run_liquid(
-        plans, offset, cutoff_velocity or self.default_cutoff_velocity,
+        operation, plans, settings, flow, offset,
+        cutoff_velocity or self.default_cutoff_velocity,
         self.default_lls_sensitivity if lls_sensitivity is None else lls_sensitivity, start, end,
+        booked,
       )  # fmt: skip
     except BaseException:
       for tracker in booked:
@@ -1243,6 +1480,9 @@ class Pipettes:
     tip_touch: Optional[TipTouch] = None,
     cutoff_velocity: Optional[float] = None,
     lls_sensitivity: Optional[int] = None,
+    immersion_depths: Optional[Sequence[float]] = None,
+    search_speed: Optional[float] = None,
+    liquid_search: Optional[LiquidSearch] = None,
     minimum_traverse_height_start: Optional[float] = None,
     minimum_traverse_height_end: Optional[float] = None,
   ) -> None:
@@ -1257,8 +1497,14 @@ class Pipettes:
       volumes: uL, one per channel.
       use_channels: 0-indexed from the back (channel 0 is probe 1); the first ones when None.
       offsets: added to the targets, mm; one for every channel (the probes share X).
-      liquid_heights: mm from `height_from`, one per channel or one for all.
-      lld_mode: liquid-level sensing: None or OFF only, until it is built.
+      liquid_heights: mm from `height_from`, one per channel or one for all. Refused with
+        `lld_mode` CAPACITIVE, whose search finds the surface.
+      lld_mode: `LLDMode.OFF` (or None): the heights as given, from the liquid only where the
+        containers' contents are tracked. `LLDMode.CAPACITIVE`: each batch searches for the
+        liquid first, as Biomek's liquid-level sensing does (conductive tips only): the probes go
+        to the search's start, then down at `search_speed` until each senses the liquid, at
+        most to `minimum_height` above the bottom; the container's contents are set from what
+        they find, and the operation goes on `immersion_depths` under it.
       flow_rates: uL/s; the pumps move together, so one rate for all.
       settling_times: STAR per-channel list (as ``Head96.aspirate`` ``settling_time``); one value for all probes.
       blow_out_air_volumes: STAR per-channel list; values must agree across probes.
@@ -1274,17 +1520,27 @@ class Pipettes:
       mix_heights: as ``Head96.aspirate``.
       cutoff_velocity: the pumps' cutoff velocity, uL/s (Biomek's technique; ``CV``).
       lls_sensitivity: liquid-level sensor sensitivity before each measured move (``SS``).
+      immersion_depths: with sensing, how far under the surface found the tips go, mm; one for
+        all. `default_immersion_depth` when None.
+      search_speed: with sensing, how fast the probes search, mm/s. `default_search_speed` when
+        None.
+      liquid_search: with sensing, where the search starts, how often it searches and its
+        tolerances (`LiquidSearch`); `default_liquid_search` (0 mm from the top, once) when None.
       minimum_traverse_height_start: as ``pick_up_tips``.
       minimum_traverse_height_end: as ``pick_up_tips``.
 
     Raises:
-      NotImplementedError: for liquid-level sensing.
-      ValueError: for channels, containers or heights that cannot be worked out, or per-channel values that differ.
+      ValueError: for channels, containers or heights that cannot be worked out, per-channel
+        values that differ, or sensing with tips that are not conductive.
+      RuntimeError: with sensing, a probe that found no liquid or a level not steady within
+        `liquid_search.fail_tolerance`, or less liquid than to aspirate (the probes lifted first,
+        as `minimum_traverse_height_end` leaves them).
     """
-    _no_lld(self, lld_mode)
+    heights = self._heights(
+      lld_mode, liquid_heights, height_from, immersion_depths, search_speed, liquid_search,
+    )  # fmt: skip
     settings = self._settings(
-      liquid_height=_one("liquid_heights", liquid_heights), height_from=height_from,
-      follow_liquid=follow_liquid, minimum_height=minimum_height, z_speed=z_speed,
+      **heights, follow_liquid=follow_liquid, minimum_height=minimum_height, z_speed=z_speed,
       approach_height=approach_height, settling_time=_one("settling_times", settling_times),
       blow_out_air_volume=_one("blow_out_air_volumes", blow_out_air_volumes),
       transport_air_volume=_one("transport_air_volumes", transport_air_volumes),
@@ -1320,22 +1576,29 @@ class Pipettes:
     empty: bool = False,
     cutoff_velocity: Optional[float] = None,
     lls_sensitivity: Optional[int] = None,
+    immersion_depths: Optional[Sequence[float]] = None,
+    search_speed: Optional[float] = None,
+    liquid_search: Optional[LiquidSearch] = None,
     minimum_traverse_height_start: Optional[float] = None,
     minimum_traverse_height_end: Optional[float] = None,
   ) -> None:
     """Push `volumes` (uL, one per channel) into `containers`, as Biomek's "S8 Pipetting" template
     does; arguments as `aspirate` and `Head96.dispense` (`post_mixes` one `Mix` for every probe,
-    as `pre_mixes`). The pumps stop at `SystemTrailingAirgap`.
+    as `pre_mixes`). The pumps stop at `SystemTrailingAirgap`. With `lld_mode` CAPACITIVE, each
+    batch searches for the liquid first, as `aspirate` does, and dispenses `immersion_depths`
+    under it.
 
     Raises:
-      NotImplementedError: for liquid-level sensing.
       ValueError: for channels, containers or heights that cannot be worked out, more than a tip
-        holds, or per-channel values that differ.
+        holds, per-channel values that differ, or sensing with tips that are not conductive.
+      RuntimeError: with sensing, a probe that found no liquid, or a container the dispense would
+        overfill (the probes lifted first, as `minimum_traverse_height_end` leaves them).
     """
-    _no_lld(self, lld_mode)
+    heights = self._heights(
+      lld_mode, liquid_heights, height_from, immersion_depths, search_speed, liquid_search,
+    )  # fmt: skip
     settings = self._settings(
-      liquid_height=_one("liquid_heights", liquid_heights), height_from=height_from,
-      follow_liquid=follow_liquid, minimum_height=minimum_height, z_speed=z_speed,
+      **heights, follow_liquid=follow_liquid, minimum_height=minimum_height, z_speed=z_speed,
       approach_height=approach_height, settling_time=_one("settling_times", settling_times),
       blow_out_air_volume=_one("blow_out_air_volumes", blow_out_air_volumes),
       blow_out_delay=blow_out_delay, tip_touch=tip_touch, empty=empty,
@@ -1345,6 +1608,169 @@ class Pipettes:
       "dispense", containers, volumes, use_channels, offsets, flow_rates, settings,
       cutoff_velocity, lls_sensitivity, minimum_traverse_height_start, minimum_traverse_height_end,
     )  # fmt: skip
+
+  def _heights(
+    self,
+    lld_mode: Any,
+    liquid_heights: Optional[Sequence[Optional[float]]],
+    height_from: Optional[HeightFrom],
+    immersion_depths: Optional[Sequence[float]],
+    search_speed: Optional[float],
+    liquid_search: Optional[LiquidSearch],
+  ) -> Dict[str, Any]:
+    """The template's height settings: as given without sensing; with it, `immersion_depths`
+    under the surface the search finds, and the search."""
+    searching = (immersion_depths, search_speed, liquid_search)
+    if not _senses(self, lld_mode):
+      if any(v is not None for v in searching):
+        raise ValueError(
+          f"{self}: immersion_depths, search_speed and liquid_search go with "
+          "lld_mode=LLDMode.CAPACITIVE"
+        )
+      return {"liquid_height": _one("liquid_heights", liquid_heights), "height_from": height_from}
+    if any(h is not None for h in liquid_heights or []):
+      raise ValueError(
+        f"{self}: liquid_heights with lld_mode CAPACITIVE: the search finds the surface; give "
+        "immersion_depths"
+      )
+    if height_from not in (None, "liquid"):
+      raise ValueError(
+        f"{self}: with lld_mode CAPACITIVE the heights are from the liquid, not {height_from}"
+      )
+    how = self.default_liquid_search if liquid_search is None else liquid_search
+    if how.start_from not in ("top", "bottom"):
+      raise ValueError(
+        f"{self}: the search starts from the top or the bottom, not {how.start_from}"
+      )
+    if how.repeats < 1:
+      raise ValueError(f"{self}: a search is made at least once, not {how.repeats} times")
+    immersion = _one("immersion_depths", immersion_depths)
+    speed = self.default_search_speed if search_speed is None else search_speed
+    search = liquid.Search(
+      start_height=how.start_height,
+      start_from=how.start_from,
+      speed=rate_to_field(self._pod, "Z1", speed),
+      repeats=how.repeats,
+      accept_tolerance=how.accept_tolerance,
+      fail_tolerance=how.fail_tolerance,
+      move_to_start=how.move_to_start,
+    )
+    depth = self.default_immersion_depth if immersion is None else immersion
+    return {"liquid_height": -depth, "height_from": "liquid", "search": search}
+
+  async def probe_liquid_heights(
+    self,
+    containers: Sequence[Container],
+    use_channels: Optional[List[int]] = None,
+    offsets: Optional[List[Coordinate]] = None,
+    lld_mode: Optional[Any] = None,
+    search_speed: Optional[float] = None,
+    n_replicates: int = 1,
+    *,
+    liquid_search: Optional[LiquidSearch] = None,
+    z_speed: Optional[float] = None,
+    minimum_height: Optional[float] = None,
+    lls_sensitivity: Optional[int] = None,
+    minimum_traverse_height_start: Optional[float] = None,
+    minimum_traverse_height_end: Optional[float] = None,
+  ) -> List[float]:
+    """Find the liquid's surface in each container with a probe's conductive tip, and say how high
+    it stands (STAR's `probe_liquid_heights`). Containers are batched as `aspirate` batches them;
+    each batch's probes go to 1 mm above their containers, search as `aspirate(lld_mode=
+    LLDMode.CAPACITIVE)` does, `n_replicates` times, and rise to 1 mm above them again. Nothing is
+    drawn and the containers' trackers are left as they are.
+
+    Args:
+      containers: one per channel.
+      use_channels: 0-indexed from the back (channel 0 is probe 1); the first ones when None.
+      offsets: added to the targets, mm; one for every channel (the probes share X).
+      lld_mode: `LLDMode.CAPACITIVE` (the one the Span-8 has) or None for it.
+      search_speed: mm/s. `default_search_speed` when None.
+      n_replicates: how many times each container is searched; the heights are averaged.
+      liquid_search: where each search starts, and Biomek's repeated searching (`LiquidSearch`;
+        each of the `n_replicates` rounds searches so); `default_liquid_search` when None.
+      z_speed: of the move to the search's start and of the rise, mm/s; `default_z_speed` when
+        None.
+      minimum_height: how low the search may go, mm above the cavity bottom; 0 when None.
+      lls_sensitivity: the sensors' sensitivity (``SS``); `default_lls_sensitivity` when None.
+      minimum_traverse_height_start: as ``pick_up_tips``.
+      minimum_traverse_height_end: as ``pick_up_tips``.
+
+    Returns:
+      How high the liquid stands above each container's cavity bottom, mm, in the order given;
+      0.0 where none was found.
+
+    Raises:
+      ValueError: for an argument out of range, a channel without a conductive tip, or a
+        container without a height <-> volume function.
+      RuntimeError: if liquid was found in some rounds and not in others, or a level is not
+        steady within `liquid_search.fail_tolerance` (the probes lifted first, as
+        `minimum_traverse_height_end` leaves them).
+    """
+    if lld_mode is not None and not _senses(self, lld_mode):
+      raise ValueError(f"{self}: a liquid search is LLDMode.CAPACITIVE, not OFF")
+    if n_replicates < 1:
+      raise ValueError(f"n_replicates must be at least 1, is {n_replicates}")
+    heights = self._heights(LLDMode.CAPACITIVE, None, None, None, search_speed, liquid_search)
+    settings = self._settings(z_speed=z_speed, minimum_height=minimum_height, **heights)
+    offset_set = {(o.x, o.y, o.z) for o in (offsets or [])}
+    if len(offset_set) > 1:
+      raise ValueError(f"{self}: the probes move together in X: one offset, please")
+    offset = (offsets or [Coordinate.zero()])[0]
+    channels = list(range(len(containers))) if use_channels is None else list(use_channels)
+    plans = self.plan_liquid(
+      "aspirate", containers, [0.0] * len(containers), channels, settings, self.default_flow_rate
+    )
+    sensitivity = self.default_lls_sensitivity if lls_sensitivity is None else lls_sensitivity
+    pod = self._pod
+    end = minimum_traverse_height_end
+    found: Dict[str, float] = {}
+    for i, plan in enumerate(plans):
+      await self._travel(plan.x, plan.y, plan.span, minimum_traverse_height_start)
+      with pod.working_at(*(c for _, c in plan.pairs)):
+        d: Dict[str, float] = {}
+        await self._send_moves(self.moves(plan, offset, d), sensitivity, d)
+        try:
+          rounds = [await self._sense(plan, sensitivity) for _ in range(n_replicates)]
+          for c in plan.channels:
+            seen = [r[c.name] for r in rounds]
+            if any(h is None for h in seen) and not all(h is None for h in seen):
+              raise RuntimeError(
+                f"{self}: probe {c.name[1:]} found liquid in some rounds and not in others"
+              )
+            found[c.name] = 0.0 if seen[0] is None else sum(seen) / len(seen)  # type: ignore[arg-type]
+        except BaseException:  # left where a finished probing would leave them
+          await pod._lift_channels(None if end is None else end / 10)
+          raise
+        await self._rise_out(plan, settings)
+        if i == len(plans) - 1:
+          await pod._lift_channels(None if end is None else end / 10)
+    return [found[f"Z{self._probe(channel)}"] for channel in channels]
+
+  async def probe_liquid_volumes(
+    self,
+    containers: Sequence[Container],
+    use_channels: Optional[List[int]] = None,
+    offsets: Optional[List[Coordinate]] = None,
+    lld_mode: Optional[Any] = None,
+    search_speed: Optional[float] = None,
+    n_replicates: int = 1,
+    **kwargs: Any,
+  ) -> List[float]:
+    """Find the liquid in each container as `probe_liquid_heights` does, and say how much there is,
+    uL, through each container's height <-> volume function (STAR's `probe_liquid_volumes`; Biomek
+    logs the same as "LLS" lines).
+
+    Raises:
+      As `probe_liquid_heights`.
+    """
+    heights = await self.probe_liquid_heights(
+      containers, use_channels, offsets, lld_mode, search_speed, n_replicates, **kwargs
+    )
+    return [
+      0.0 if h <= 0 else container.compute_volume_from_height(h)
+      for container, h in zip(containers, heights)
+    ]
 
 
 def _one(name: str, values: Optional[Sequence[Optional[float]]]) -> Optional[float]:
@@ -1366,6 +1792,13 @@ def _one_mix(name: str, mixes: Optional[Sequence[Optional[Mix]]]) -> Optional[Mi
   return given.pop() if given else None
 
 
-def _no_lld(pipettes: Pipettes, lld_mode: Any) -> None:
-  if lld_mode is not None and getattr(lld_mode, "name", lld_mode) != "OFF":
-    raise NotImplementedError(f"{pipettes}: liquid-level sensing is not built yet")
+def _senses(pipettes: Pipettes, lld_mode: Any) -> bool:
+  """Whether `lld_mode` (`LLDMode`, or STAR's of the same name) asks for a search."""
+  name = getattr(lld_mode, "name", lld_mode)
+  if lld_mode is None or name == "OFF":
+    return False
+  if name == "CAPACITIVE":
+    return True
+  raise ValueError(
+    f"{pipettes}: a Span-8 senses liquid by capacitance (LLDMode.CAPACITIVE), not {name}"
+  )

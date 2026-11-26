@@ -141,19 +141,48 @@ class PodMoveTests(PodMoveTest):
     await pod.home()
     self.assertEqual(pod.cpositions["X"], (None, pod.axis("X").home_position))
 
-  async def test_sensor_stop_is_reported_with_its_position(self) -> None:
-    driver = await self.homed()
+  async def test_sensor_stop_is_answered_in_target_counts_and_read_before_the_next_move(
+    self,
+  ) -> None:
+    # Biomek's logs (2026-11-25, a liquid-level sense on probe 1, whose hysteresis is -862): the
+    # sense to -79087 went to the drive as -79949, the drive sensed liquid at -77944, the Master
+    # Controller answered -77082, and Biomek's next move, to -78046, went to the drive as -78908
+    # after Stop Motion Service, Set Z1 State ENABLED and Get Z1 Current Position.
+    config = generic_configuration()
+    for axis in config.modules["span8"]:
+      if axis["name"] == "Z1":
+        axis["hysteresis"] = -862
+    driver = await self.homed(configuration=sealed(config))
     pod = self.pod(driver, "right")
-    z1 = self.usb(driver, "span8").axis_model("Z1")
-    await pod.move_axes({"Z1": -10000})
-    z1.sensed_at = -150000
-    result = await pod.move_axes({"Z1": -200000, "Z2": -200000}, sensors={"Z1": (1, 1)})
+    usb = self.usb(driver, "span8")
+    await pod.move_axes({"Z1": -74746, "Z2": -74746})
+    usb.axis_model("Z1").sensed_at = -77944
+    sensors = {"Z1": (p.LLS_CD_SENSOR, p.SENSOR_TRIP), "Z2": (p.LLS_CD_SENSOR, p.SENSOR_TRIP)}
+    self.mark(driver)
+    result = await pod.move_axes({"Z1": -79087, "Z2": -79087}, speed=200, sensors=sensors)
+    axis = pod.axis("Z1")
+    z1 = next(
+      m[5:]
+      for m in usb.requests[self.marks["span8"] :]
+      if (m[0], m[1], m[4]) == (axis.device, axis.index, 0x40)
+    )
+    self.assertEqual(struct.unpack_from("<iBB", z1, 16), (-79949, p.LLS_CD_SENSOR, p.SENSOR_TRIP))
     self.assertEqual(result.completions["Z1"].outcome, "liquid-sensed")
-    self.assertEqual(result.stopped_at("Z1"), -150000)
+    self.assertEqual(result.completions["Z1"].position, -77944)
+    self.assertEqual(result.stopped_at("Z1"), -77082)
+    # Z2 met no liquid: it reached its target and says so, and its position stays known.
+    self.assertEqual(result.completions["Z2"].outcome, "liquid-not-sensed")
     self.assertIsNone(result.stopped_at("Z2"))
-    # The reported position is taken as Z1's, as the Master Controller takes it, with its hysteresis as for any move.
-    self.assertEqual(pod.cpositions["Z1"][0], -150000)
     self.assertIsNotNone(pod.cpositions["Z2"][0])
+    self.assertIsNone(pod.cpositions["Z1"][0])  # read before the next move
+    self.mark(driver)
+    await pod.move_axes({"Z1": -78046})
+    names = [name for name, _ in self.sent(driver, "span8")]
+    self.assertEqual(
+      names[:4],
+      ["Stop Motion Service", "Set State", "Get Current Position", "Set Move Parameters"],
+    )
+    self.assertEqual(usb.axis_model("Z1").position, -78908)
 
   async def test_both_pods_move_together(self) -> None:
     driver = await self.homed()

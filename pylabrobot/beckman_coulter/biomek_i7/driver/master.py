@@ -175,6 +175,9 @@ class BiomekI7Driver:
     # In simulation, what has a pod's GG stop on labware the gripper closes on (its width, cm;
     # None: nothing between the fingers). Set by `simulator.simulate_grips`.
     self.simulated_grip: Optional[Callable[[Pod, Optional[float]], None]] = None
+    # In simulation, where each Span-8 probe's liquid-level sensor fires on the search about to
+    # start (drive counts per Z axis; None: no liquid). Set by `simulator.simulate_liquid`.
+    self.simulated_liquid: Optional[Callable[[Pod, Dict[str, Optional[int]]], None]] = None
 
   # -- lifecycle -------------------------------------------------------------
 

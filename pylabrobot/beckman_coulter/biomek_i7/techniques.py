@@ -39,13 +39,24 @@ mapping is here:
 | Mix + count, volume, aspirate / dispense speed (uL/s), Follow Liquid | `pre_mix` (aspirate) / `post_mix` (dispense): PyLabRobot's `Mix`, `auto_surface_following` from Follow Liquid |
 | Mix aspirate / dispense height (mm) and from | `mix_heights` (`MixHeights`) |
 | cutoff velocity (uL/s), conductivity (Span-8) | `cutoff_velocity`, `lls_sensitivity` |
+| with `lld=True` (Span-8): the height from the liquid; Liquid Level Sensing's sense speed (%); its start height and from (Top / Bottom), whether to move there, Sense count, accept / fail tolerances (uL) | `immersion_depth` (mm under the surface found), `lld_mode` CAPACITIVE, `search_speed` (mm/s), `liquid_search` (`LiquidSearch`) |
 
 A mix's draw and push share one flow rate (PyLabRobot's `Mix`), so a technique whose two mix speeds
 differ is refused, as is a mix volume or count that is an expression (`=DilutionVolume`: a method's
 variable, which only the method knows; pass the `Mix` yourself). Prewet maps to an argument the
 features do not take yet; a technique that turns it on is refused rather than run without it.
-Liquid-level sensing and clot detection are not read from a technique yet: a technique that turns
-them on runs without them. `CalibrationSlope` /
+Biomek senses the liquid when a height is measured from it, its level is not known and the tips are
+LLS tips; the technique holds how (its Liquid Level Sensing tab; a Sense count of 0 turns it off).
+Which tips a caller holds the technique does not know, so sensing is the caller's choice:
+`lld=True` turns the technique's height from the liquid into the depth under the surface the search
+finds, and adds the search's settings. As Biomek's logs show it, the search starts at the
+technique's "Move to" height from the Top (or Bottom), goes down at its sense speed to the
+technique's minimum height above the bottom, and the container is taken to hold what its shape
+holds up to where the tip stopped; a Sense count above 1 searches again, each search judged so, and
+stops early or refuses an unsteady level by its tolerances (`LiquidSearch`). A start from the
+liquid, which only 96-head techniques (which never sense) carry, is refused. When a search finds
+nothing, the features raise (Biomek's error handling, its retries and fall-backs, is not built). Clot detection is a
+template step of its own, for fixed tips, which the driver does not do. `CalibrationSlope` /
 `CalibrationOffset` (volume correction) are not applied: how Biomek applies them is not traced, and
 a technique with other than 1 / 0 is refused.
 
@@ -55,6 +66,7 @@ the reservoir variants of the standard templates move every aspirate 2 mm to the
 `method_step_arguments` gives all of it, the offset as a `Coordinate` (mm).
 """
 
+import enum
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Literal, Mapping, Optional, Tuple
 
@@ -89,6 +101,16 @@ class Conditioning:
 
 
 HeightFrom = Literal["bottom", "top", "liquid"]
+
+
+class LLDMode(enum.Enum):
+  """How a channel finds the liquid, numbered as STAR's `LLDMode`. A Span-8 senses it by
+  capacitance, through conductive tips (Biomek's LLS tips)."""
+
+  OFF = 0
+  CAPACITIVE = 1
+
+
 """What a height is measured from: the container's bottom, its top, or the liquid in it."""
 
 
@@ -108,6 +130,24 @@ class TipTouch:
   speed_fraction: float = 1.0
   delay: float = 0.0
   distance: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class LiquidSearch:
+  """How a Span-8 searches for the liquid, beyond STAR's `search_speed` (Biomek's Liquid Level
+  Sensing tab of a technique). The probes go to `start_height` mm from `start_from` ("top" or
+  "bottom") and search down from there; with `move_to_start` False they search from where they
+  stand. Up to `repeats` searches: each is judged as the volume each container holds up to where
+  its probe stopped. With `accept_tolerance` (uL), the searching stops early once every probe's
+  volume is within it of its search before; with `fail_tolerance` (uL), a probe whose last two
+  searches differ by more is refused (Biomek's "unstable"). The last search counts."""
+
+  start_height: float = 0.0
+  start_from: HeightFrom = "top"
+  repeats: int = 1
+  accept_tolerance: Optional[float] = None
+  fail_tolerance: Optional[float] = None
+  move_to_start: bool = True
 
 
 @dataclass(frozen=True)
@@ -280,18 +320,70 @@ def _span8(liquid: Mapping[str, Any], general: Mapping[str, Any]) -> Dict[str, A
   }
 
 
+def _sensing(
+  args: Dict[str, Any], technique: BiomekTechnique, arm: "Pod", lld: bool
+) -> Dict[str, Any]:
+  """`args` with the technique's liquid-level sensing (`lld`): its height from the liquid as the
+  depth under the surface found, and the search's settings."""
+  if not lld:
+    return args
+  general = technique.general
+  if arm.pipettes is None:
+    raise ValueError(f"{arm} has no liquid-level sensors: only a Span-8 senses the liquid")
+  if args.get("height_from") != "liquid":
+    raise ValueError(
+      f"technique {technique.name!r}: the height is from the {args.get('height_from')}, not the"
+      " liquid: there is nothing to sense"
+    )
+  repeat = int(general.get("llsrepeat", 1))
+  if repeat == 0:
+    raise ValueError(f"technique {technique.name!r} turns liquid-level sensing off (Sense 0)")
+  start_from = HEIGHT_FROM.get(int(general.get("llsinitialheightfrom", 2)))
+  if start_from not in ("top", "bottom"):
+    raise NotImplementedError(
+      f"technique {technique.name!r} starts its search from the {start_from}, which the driver "
+      "does not do (the editor offers Top and Bottom)"
+    )
+  z = arm.channel_z_axes[0]
+  out = dict(args)
+  out["immersion_depth"] = -float(out.pop("liquid_height"))
+  del out["height_from"]
+  out.update(
+    lld_mode=LLDMode.CAPACITIVE,
+    search_speed=units.field_to_rate(
+      arm, z, units.percent_to_field(float(general.get("detectionspeed", 20.0)))
+    ),
+    liquid_search=LiquidSearch(
+      start_height=float(general.get("llsinitialheight", 0.0)),
+      start_from=start_from,
+      repeats=repeat,
+      accept_tolerance=(
+        float(general.get("llsacceptvalue", 0.0)) if general.get("llsaccept") else None
+      ),
+      fail_tolerance=float(general.get("llsfailvalue", 0.0)) if general.get("llsfail") else None,
+      move_to_start=bool(general.get("llsinitial", True)),
+    ),
+  )
+  return out
+
+
 def aspirate_arguments(
   technique: BiomekTechnique,
   liquid_type: Optional[BiomekLiquidType] = None,
   *,
   arm: "Pod",
+  lld: bool = False,
 ) -> Dict[str, Any]:
   """The aspirate arguments a technique (and liquid type) stand for on `arm` (its Z speed in mm/s
   on that arm's Z, from Biomek's %, exactly); a Span-8 arm adds its own (`cutoff_velocity`,
-  `lls_sensitivity`). With the section's Mix on, `pre_mix` and `mix_heights`. Scalars: a Span-8
-  caller lists the per-channel ones (`for_channels`).
+  `lls_sensitivity`). With the section's Mix on, `pre_mix` and `mix_heights`. With `lld` (a
+  Span-8 holding conductive tips), the height from the liquid is the depth under the surface the
+  technique's search finds (see the module). Scalars: a Span-8 caller lists the per-channel ones
+  (`for_channels`).
 
   Raises:
+    ValueError: with `lld`, for an arm without sensors, a height not from the liquid, or a
+      technique that turns sensing off.
     NotImplementedError: if the technique turns on what the driver does not do yet, or mixes with
       two speeds or a volume it cannot evaluate.
   """
@@ -320,7 +412,7 @@ def aspirate_arguments(
     args.update(pre_mix=mix["mix"], mix_heights=mix["mix_heights"])
   if arm.pipettes is not None:
     args.update(_span8(liquid, general))
-  return args
+  return _sensing(args, technique, arm, lld)
 
 
 def dispense_arguments(
@@ -328,11 +420,13 @@ def dispense_arguments(
   liquid_type: Optional[BiomekLiquidType] = None,
   *,
   arm: "Pod",
+  lld: bool = False,
 ) -> Dict[str, Any]:
   """The dispense arguments a technique (and liquid type) stand for; as `aspirate_arguments`,
   the mix as `post_mix`.
 
   Raises:
+    ValueError: as `aspirate_arguments`.
     NotImplementedError: if the technique turns on what the driver does not do yet.
   """
   section, general = technique.dispense, technique.general
@@ -352,7 +446,7 @@ def dispense_arguments(
     args.update(post_mix=mix["mix"], mix_heights=mix["mix_heights"])
   if arm.pipettes is not None:
     args.update(_span8(liquid, general))
-  return args
+  return _sensing(args, technique, arm, lld)
 
 
 # What the reservoir templates change in the standard ones, per operation (their records, project
@@ -366,13 +460,18 @@ TEMPLATE_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
 
 
 def method_step_arguments(
-  step: Mapping[str, Any], liquid_type: Optional[BiomekLiquidType] = None, *, arm: "Pod"
+  step: Mapping[str, Any],
+  liquid_type: Optional[BiomekLiquidType] = None,
+  *,
+  arm: "Pod",
+  lld: bool = False,
 ) -> Dict[str, Any]:
   """The arguments a method's Aspirate or Dispense step stands for, on `arm` (a step's
   `Operation`, `Span8`, its `technique` (`asdict(BiomekTechnique)`), and `Height` / `HeightFrom`
   when it overrides the technique's): `aspirate_arguments` / `dispense_arguments`, and
   `offset` (a `Coordinate`, mm; a Span-8 caller passes it per channel as `offsets`) and
-  `approach_height` from its template.
+  `approach_height` from its template. `lld` as `aspirate_arguments`, applied to the step's own
+  height when it has one.
 
   Raises:
     ValueError: for a step that is not an aspirate or a dispense.
@@ -391,6 +490,7 @@ def method_step_arguments(
   if step.get("OverrideHeight") or step.get("CustomHeight"):
     args["liquid_height"] = float(step["Height"])
     args["height_from"] = HEIGHT_FROM[int(step["HeightFrom"])]
+  args = _sensing(args, technique, arm, lld)
   extra = TEMPLATE_VARIANTS.get(technique.template, {}).get(operation, {})
   offset: Tuple[float, float] = extra.get("offset", (0.0, 0.0))
   args["offset"] = Coordinate(offset[0], offset[1], 0)
@@ -402,9 +502,10 @@ def method_step_arguments(
 def for_channels(args: Mapping[str, Any], channels: int) -> Dict[str, Any]:
   """`args` for a Span-8's `aspirate` / `dispense`, which take STAR's per-channel arguments: the
   same `liquid_height`, `flow_rate`, `offset`, `settling_time`, `blow_out_air_volume`,
-  `transport_air_volume`, `pre_mix` and `post_mix` on each of `channels` channels (as
-  `liquid_heights`, `flow_rates`, `offsets`, `settling_times`, `blow_out_air_volumes`,
-  `transport_air_volumes`, `pre_mixes`, `post_mixes`)."""
+  `transport_air_volume`, `pre_mix`, `post_mix` and `immersion_depth` on each of `channels`
+  channels (as `liquid_heights`, `flow_rates`, `offsets`, `settling_times`,
+  `blow_out_air_volumes`, `transport_air_volumes`, `pre_mixes`, `post_mixes`,
+  `immersion_depths`)."""
   out = dict(args)
   for one, many in (
     ("liquid_height", "liquid_heights"),
@@ -415,6 +516,7 @@ def for_channels(args: Mapping[str, Any], channels: int) -> Dict[str, Any]:
     ("transport_air_volume", "transport_air_volumes"),
     ("pre_mix", "pre_mixes"),
     ("post_mix", "post_mixes"),
+    ("immersion_depth", "immersion_depths"),
   ):
     if one in out:
       out[many] = [out.pop(one)] * channels

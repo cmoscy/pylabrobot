@@ -35,6 +35,8 @@ from pylabrobot.beckman_coulter.biomek_i7.driver.board import AceBoard
 from pylabrobot.beckman_coulter.biomek_i7.driver.framing import frame, split
 from pylabrobot.beckman_coulter.biomek_i7.driver.motors import Axis, MotorTables
 from pylabrobot.beckman_coulter.biomek_i7.driver.protocol import (
+  LLS_CD_SENSOR,
+  LLS_LIQUID_NOT_SENSED,
   LLS_LIQUID_SENSED,
   AxisState,
   Device,
@@ -165,7 +167,8 @@ class SimulatedAceUSB(ReplayAceUSB):
   A move with a force limit stops where the axis meets something (`_AxisModel.obstacle`, set by a
   test), and the axis then reads `stalled_effort` as its control effort (a gripper holding a
   plate). A move with a sensor stops where the sensor fires (`_AxisModel.sensed_at`), and the
-  Move All carries that axis's report (LLS_LIQUID_SENSED and the position) under its sequence.
+  Move All carries that axis's report (LLS_LIQUID_SENSED and the position) under its sequence; a
+  liquid-level sensing move that reaches its target reports LLS_LIQUID_NOT_SENSED.
   A pump keeps the valve it was last
   moved through. Get Tip Status answers `tip_states` when set, else `tip_sensor()` when set (the
   simulator does not model tips; `sense_recorded_tips` has it report the session's), else from the
@@ -319,11 +322,12 @@ class SimulatedAceUSB(ReplayAceUSB):
       reports = []
       self._move_seconds = max((m.duration() for m in self.axes.values()), default=0.0)
       for (axis_device, axis_index), model in self.axes.items():
-        if model.finish_move() == "sensed":
-          reports.append(
-            bytes([axis_device, axis_index, 0, message[3], 0x50, 0x02, 0x00, LLS_LIQUID_SENSED])
-            + struct.pack("<i", model.position)
-          )
+        ended = model.finish_move()
+        head = bytes([axis_device, axis_index, 0, message[3], 0x50, 0x02, 0x00])
+        if ended == "sensed":
+          reports.append(head + bytes([LLS_LIQUID_SENSED]) + struct.pack("<i", model.position))
+        elif ended == "not sensed":  # the Master Controller reads a 1-byte report as this
+          reports.append(head + bytes([LLS_LIQUID_NOT_SENSED]))
       return [accepted, *reports, done]
     if device == Device.TIP_SENSOR and opcode == 0x10 and self.tip_states is not None:
       return [done + self.tip_states]
@@ -426,7 +430,8 @@ class _AxisModel:
 
   def finish_move(self) -> Optional[str]:
     """Run the pending move to its end: its target, or where force or a sensor stops it. Returns
-    "stalled" or "sensed" for those, else None."""
+    "stalled" or "sensed" for those, "not sensed" for a liquid-level sensing move that reached its
+    target, else None."""
     if self.pending is None:
       return None
     low, high = sorted((self.position, self.pending))
@@ -443,7 +448,7 @@ class _AxisModel:
       self.position = sensed_at
       return "sensed"
     self.position = target
-    return None
+    return "not sensed" if self.sensor == LLS_CD_SENSOR else None
 
 
 # The analog input carrying the interlocked drive supply, per module (the Master Controller's cold
@@ -520,6 +525,22 @@ def simulate_grips(driver: "BiomekI7Driver", boards: Sequence[AceBoard]) -> None
     io.axis_model("GG").obstacle = None if width is None else pod.declared.to_counts("GG", width)
 
   driver.simulated_grip = grip
+
+
+def simulate_liquid(driver: "BiomekI7Driver", boards: Sequence[AceBoard]) -> None:
+  """Have each simulated Span-8 probe's liquid-level sensor fire where its pipettes put the
+  liquid its container's tracker holds, so a simulated run's liquid-level sensing finds what the
+  resource tree says is there. `boards`: the driver's simulated boards."""
+  models = {b.name: b.io for b in boards if isinstance(b.io, SimulatedAceUSB)}
+
+  def liquid(pod: "Pod", levels: Dict[str, Optional[int]]) -> None:
+    io = models.get(f"simulated {pod.module_type}")
+    if io is None:
+      return
+    for axis, at in levels.items():
+      io.axis_model(axis).sensed_at = at
+
+  driver.simulated_liquid = liquid
 
 
 def sense_recorded_tips(driver: "BiomekI7Driver", boards: Sequence[AceBoard]) -> None:
